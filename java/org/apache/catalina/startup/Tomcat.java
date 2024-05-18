@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.startup;
 
 import java.io.File;
@@ -79,81 +63,9 @@ import org.apache.tomcat.util.file.ConfigurationSource;
 import org.apache.tomcat.util.modeler.Registry;
 import org.apache.tomcat.util.res.StringManager;
 
-// TODO: lazy init for the temp dir - only when a JSP is compiled or
-// get temp dir is called we need to create it. This will avoid the
-// need for the baseDir
-
-// TODO: allow contexts without a base dir - i.e.
-// only programmatic. This would disable the default servlet.
-
 /**
  * Minimal tomcat starter for embedding/unit tests.
  *
- * <p>
- * Tomcat supports multiple styles of configuration and
- * startup - the most common and stable is server.xml-based,
- * implemented in org.apache.catalina.startup.Bootstrap.
- *
- * <p>
- * This class is for use in apps that embed tomcat.
- *
- * <p>
- * Requirements:
- * <ul>
- *   <li>all tomcat classes and possibly servlets are in the classpath.
- *       (for example all is in one big jar, or in eclipse CP, or in
- *        any other combination)</li>
- *
- *   <li>we need one temporary directory for work files</li>
- *
- *   <li>no config file is required. This class provides methods to
- *       use if you have a webapp with a web.xml file, but it is
- *       optional - you can use your own servlets.</li>
- * </ul>
- *
- * <p>
- * There are a variety of 'add' methods to configure servlets and webapps. These
- * methods, by default, create a simple in-memory security realm and apply it.
- * If you need more complex security processing, you can define a subclass of
- * this class.
- *
- * <p>
- * This class provides a set of convenience methods for configuring web
- * application contexts; all overloads of the method <code>addWebapp()</code>.
- * These methods are equivalent to adding a web application to the Host's
- * appBase (normally the webapps directory). These methods create a Context,
- * configure it with the equivalent of the defaults provided by
- * <code>conf/web.xml</code> (see {@link #initWebappDefaults(String)} for
- * details) and add the Context to a Host. These methods do not use a global
- * default web.xml; rather, they add a {@link LifecycleListener} to configure
- * the defaults. Any WEB-INF/web.xml and META-INF/context.xml packaged with the
- * application will be processed normally. Normal web fragment and
- * {@link javax.servlet.ServletContainerInitializer} processing will be applied.
- *
- * <p>
- * In complex cases, you may prefer to use the ordinary Tomcat API to create
- * webapp contexts; for example, you might need to install a custom Loader
- * before the call to {@link Host#addChild(Container)}. To replicate the basic
- * behavior of the <code>addWebapp</code> methods, you may want to call two
- * methods of this class: {@link #noDefaultWebXmlPath()} and
- * {@link #getDefaultWebXmlListener()}.
- *
- * <p>
- * {@link #getDefaultWebXmlListener()} returns a {@link LifecycleListener} that
- * adds the standard DefaultServlet, JSP processing, and welcome files. If you
- * add this listener, you must prevent Tomcat from applying any standard global
- * web.xml with ...
- *
- * <p>
- * {@link #noDefaultWebXmlPath()} returns a dummy pathname to configure to
- * prevent {@link ContextConfig} from trying to apply a global web.xml file.
- *
- * <p>
- * This class provides a main() and few simple CLI arguments,
- * see setters for doc. It can be used for simple tests and
- * demo.
- *
- * @see <a href="https://gitbox.apache.org/repos/asf?p=tomcat.git;a=blob;f=test/org/apache/catalina/startup/TestTomcat.java">TestTomcat</a>
  * @author Costin Manolache
  */
 public class Tomcat {
@@ -187,23 +99,6 @@ public class Tomcat {
      * Tomcat requires that the base directory is set because the defaults for
      * a number of other locations, such as the work directory, are derived from
      * the base directory. This should be the first method called.
-     * <p>
-     * If this method is not called then Tomcat will attempt to use these
-     * locations in the following order:
-     * <ol>
-     *  <li>if set, the catalina.base system property</li>
-     *  <li>if set, the catalina.home system property</li>
-     *  <li>The user.dir system property (the directory where Java was run from)
-     *      where a directory named tomcat.$PORT will be created. $PORT is the
-     *      value configured via {@link #setPort(int)} which defaults to 8080 if
-     *      not set</li>
-     * </ol>
-     * The user should ensure that the file permissions for the base directory
-     * are appropriate.
-     * <p>
-     * TODO: disable work dir if not needed ( no jsp, etc ).
-     *
-     * @param basedir The Tomcat base folder on which all others will be derived
      */
     public void setBaseDir(String basedir) {
         this.basedir = basedir;
@@ -305,43 +200,7 @@ public class Tomcat {
      * Add a context - programmatic mode, no default web.xml used. This means
      * that there is no JSP support (no JSP servlet), no default servlet and
      * no web socket support unless explicitly enabled via the programmatic
-     * interface. There is also no
-     * {@link javax.servlet.ServletContainerInitializer} processing and no
-     * annotation processing. If a
-     * {@link javax.servlet.ServletContainerInitializer} is added
-     * programmatically, there will still be no scanning for
-     * {@link javax.servlet.annotation.HandlesTypes} matches.
-     *
-     * <p>
-     * API calls equivalent with web.xml:
-     *
-     * <pre>{@code
-     *  // context-param
-     *  ctx.addParameter("name", "value");
-     *
-     *
-     *  // error-page
-     *  ErrorPage ep = new ErrorPage();
-     *  ep.setErrorCode(500);
-     *  ep.setLocation("/error.html");
-     *  ctx.addErrorPage(ep);
-     *
-     *  ctx.addMimeMapping("ext", "type");
-     * }</pre>
-     *
-     *
-     * <p>
-     * Note: If you reload the Context, all your configuration will be lost. If
-     * you need reload support, consider using a LifecycleListener to provide
-     * your configuration.
-     *
-     * <p>
-     * TODO: add the rest
-     *
-     * @param contextPath The context mapping to use, "" for root context.
-     * @param docBase Base directory for the context, for static files.
-     *  Must exist, relative to the server home
-     * @return the deployed context
+     * interface.
      */
     public Context addContext(String contextPath, String docBase) {
         return addContext(getHost(), contextPath, docBase);
@@ -349,22 +208,6 @@ public class Tomcat {
 
     /**
      * Equivalent to &lt;servlet&gt;&lt;servlet-name&gt;&lt;servlet-class&gt;.
-     *
-     * <p>
-     * In general it is better/faster to use the method that takes a
-     * Servlet as param - this one can be used if the servlet is not
-     * commonly used, and want to avoid loading all deps.
-     * ( for example: jsp servlet )
-     *
-     * You can customize the returned servlet, ex:
-     *  <pre>
-     *    wrapper.addInitParameter("name", "value");
-     *  </pre>
-     *
-     * @param contextPath   Context to add Servlet to
-     * @param servletName   Servlet name (used in mappings)
-     * @param servletClass  The class to be used for the Servlet
-     * @return The wrapper for the servlet
      */
     public Wrapper addServlet(String contextPath,
             String servletName,
