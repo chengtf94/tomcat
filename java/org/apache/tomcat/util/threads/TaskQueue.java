@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.tomcat.util.threads;
 
 import java.util.Collection;
@@ -24,43 +8,34 @@ import java.util.concurrent.TimeUnit;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
- * As task queue specifically designed to run with a thread pool executor. The
- * task queue is optimised to properly utilize threads within a thread pool
- * executor. If you use a normal queue, the executor will spawn threads when
- * there are idle threads and you won't be able to force items onto the queue
- * itself.
+ * 定制版任务队列
  */
 public class TaskQueue extends LinkedBlockingQueue<Runnable> {
 
     private static final long serialVersionUID = 1L;
     protected static final StringManager sm = StringManager.getManager(TaskQueue.class);
 
+    /** 所属线程池 */
     private transient volatile ThreadPoolExecutor parent = null;
-
-    public TaskQueue() {
-        super();
-    }
-
-    public TaskQueue(int capacity) {
-        super(capacity);
-    }
-
-    public TaskQueue(Collection<? extends Runnable> c) {
-        super(c);
-    }
-
     public void setParent(ThreadPoolExecutor tp) {
         parent = tp;
     }
 
+    /**
+     * 构造方法
+     */
+    public TaskQueue() {
+        super();
+    }
+    public TaskQueue(int capacity) {
+        super(capacity);
+    }
+    public TaskQueue(Collection<? extends Runnable> c) {
+        super(c);
+    }
 
     /**
-     * Used to add a task to the queue if the task has been rejected by the Executor.
-     *
-     * @param o         The task to add to the queue
-     *
-     * @return          {@code true} if the task was added to the queue,
-     *                      otherwise {@code false}
+     * 若任务被Executor拒绝执行后，则添加该任务入队
      */
     public boolean force(Runnable o) {
         if (parent == null || parent.isShutdown()) {
@@ -69,22 +44,6 @@ public class TaskQueue extends LinkedBlockingQueue<Runnable> {
         return super.offer(o); //forces the item onto the queue, to be used if the task is rejected
     }
 
-
-    /**
-     * Used to add a task to the queue if the task has been rejected by the Executor.
-     *
-     * @param o         The task to add to the queue
-     * @param timeout   The timeout to use when adding the task
-     * @param unit      The units in which the timeout is expressed
-     *
-     * @return          {@code true} if the task was added to the queue,
-     *                      otherwise {@code false}
-     *
-     * @throws InterruptedException If the call is interrupted before the
-     *                              timeout expires
-     *
-     * @deprecated Unused. Will be removed in Tomcat 10.1.x.
-     */
     @Deprecated
     public boolean force(Runnable o, long timeout, TimeUnit unit) throws InterruptedException {
         if (parent == null || parent.isShutdown()) {
@@ -93,37 +52,39 @@ public class TaskQueue extends LinkedBlockingQueue<Runnable> {
         return super.offer(o,timeout,unit); //forces the item onto the queue, to be used if the task is rejected
     }
 
-
+    /**
+     * 线程池调⽤任务队列的⽅法时，当前线程数肯定已经⼤于核⼼线程数了
+     * 只有当前线程数⼤于核⼼线程数、⼩于最⼤线程数，并且已提交的任务个数⼤于当前线程数时，即线程不够⽤了，但是线程数⼜没达到极限，才会去创建新的线程。
+     * 这就是为什么Tomcat需要维护已提交任务数这个变量，它的⽬的就是在任务队列的⻓度⽆限制的情况下，让线程池有机会创建新的线程。
+     */
     @Override
     public boolean offer(Runnable o) {
       //we can't do any checks
-        if (parent==null) {
+        if (parent == null) {
             return super.offer(o);
         }
-        //we are maxed out on threads, simply queue the object
+        // 如果线程数已经到了最⼤值，不能创建新线程了，只能把任务添加到任务队列
         if (parent.getPoolSizeNoLock() == parent.getMaximumPoolSize()) {
             return super.offer(o);
         }
-        //we have idle threads, just add it to the queue
+        // 执⾏到这⾥，表明当前线程数⼤于核⼼线程数，并且⼩于最⼤线程数，表明是可以创建新线程的，那到底要不要创建呢？分两种情况：
+        // 1. 如果已提交的任务数⼩于当前线程数，表示还有空闲线程，⽆需创建新线程
         if (parent.getSubmittedCount() <= parent.getPoolSizeNoLock()) {
             return super.offer(o);
         }
-        //if we have less threads than maximum force creation of a new thread
+        // 2. 如果已提交的任务数⼤于当前线程数，线程不够⽤了，返回false去创建新线程
         if (parent.getPoolSizeNoLock() < parent.getMaximumPoolSize()) {
             return false;
         }
-        //if we reached here, we need to add it to the queue
+        // if we reached here, we need to add it to the queue
         return super.offer(o);
     }
-
 
     @Override
     public Runnable poll(long timeout, TimeUnit unit)
             throws InterruptedException {
         Runnable runnable = super.poll(timeout, unit);
         if (runnable == null && parent != null) {
-            // the poll timed out, it gives an opportunity to stop the current
-            // thread if needed to avoid memory leaks.
             parent.stopCurrentThreadIfNeeded();
         }
         return runnable;
@@ -134,10 +95,8 @@ public class TaskQueue extends LinkedBlockingQueue<Runnable> {
         if (parent != null && parent.currentThreadShouldBeStopped()) {
             return poll(parent.getKeepAliveTime(TimeUnit.MILLISECONDS),
                     TimeUnit.MILLISECONDS);
-            // yes, this may return null (in case of timeout) which normally
-            // does not occur with take()
-            // but the ThreadPoolExecutor implementation allows this
         }
         return super.take();
     }
+
 }
