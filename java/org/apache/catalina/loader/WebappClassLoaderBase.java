@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.loader;
 
 import java.io.File;
@@ -80,34 +64,6 @@ import org.apache.tomcat.util.threads.ThreadPoolExecutor;
 
 /**
  * Specialized web application class loader.
- * <p>
- * This class loader is a full reimplementation of the <code>URLClassLoader</code> from the JDK. It is designed to be
- * fully compatible with a normal <code>URLClassLoader</code>, although its internal behavior may be completely
- * different.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - By default, this class loader follows the delegation model required by the
- * specification. The bootstrap class loader will be queried first, then the local repositories, and only then
- * delegation to the parent class loader will occur. This allows the web application to override any shared class except
- * the classes from J2SE. Special handling is provided from the JAXP XML parser interfaces, the JNDI interfaces, and the
- * classes from the servlet API, which are never loaded from the webapp repositories. The <code>delegate</code> property
- * allows an application to modify this behavior to move the parent class loader ahead of the local repositories.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - Due to limitations in Jasper compilation technology, any repository which
- * contains classes from the servlet API will be ignored by the class loader.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - The class loader generates source URLs which include the full JAR URL when a
- * class is loaded from a JAR file, which allows setting security permission at the class level, even when a class is
- * contained inside a JAR.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - Local repositories are searched in the order they are added via the initial
- * constructor.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - No check for sealing violations or security is made unless a security manager
- * is present.
- * <p>
- * <strong>IMPLEMENTATION NOTE</strong> - As of 8.0, this class loader implements {@link InstrumentableClassLoader},
- * permitting web application classes to instrument other classes in the same web application. It does not permit
- * instrumentation of system or container classes or classes in other web apps.
  *
  * @author Remy Maucherat
  * @author Craig R. McClanahan
@@ -116,6 +72,426 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
         implements Lifecycle, InstrumentableClassLoader, WebappProperties, PermissionCheck {
 
     private static final Log log = LogFactory.getLog(WebappClassLoaderBase.class);
+
+    @Override
+    public Class<?> findClass(String name) throws ClassNotFoundException {
+
+        if (log.isDebugEnabled()) {
+            log.debug("    findClass(" + name + ")");
+        }
+
+        checkStateForClassLoading(name);
+
+        // (1) Permission to define this class when using a SecurityManager
+        if (securityManager != null) {
+            int i = name.lastIndexOf('.');
+            if (i >= 0) {
+                try {
+                    if (log.isTraceEnabled()) {
+                        log.trace("      securityManager.checkPackageDefinition");
+                    }
+                    securityManager.checkPackageDefinition(name.substring(0, i));
+                } catch (Exception se) {
+                    if (log.isTraceEnabled()) {
+                        log.trace("      -->Exception-->ClassNotFoundException", se);
+                    }
+                    throw new ClassNotFoundException(name, se);
+                }
+            }
+        }
+
+        Class<?> clazz = null;
+        try {
+            if (log.isTraceEnabled()) {
+                log.trace("      findClassInternal(" + name + ")");
+            }
+            try {
+                if (securityManager != null) {
+                    PrivilegedAction<Class<?>> dp = new PrivilegedFindClassByName(name);
+                    clazz = AccessController.doPrivileged(dp);
+                } else {
+                    // 1. 先在Web应⽤⽬录下查找类
+                    clazz = findClassInternal(name);
+                }
+            } catch (AccessControlException ace) {
+                log.warn(sm.getString("webappClassLoader.securityException", name, ace.getMessage()), ace);
+                throw new ClassNotFoundException(name, ace);
+            } catch (RuntimeException e) {
+                if (log.isTraceEnabled()) {
+                    log.trace("      -->RuntimeException Rethrown", e);
+                }
+                throw e;
+            }
+            if (clazz == null && hasExternalRepositories) {
+                try {
+                    // 2. 如果在本地⽬录没有找到，交给⽗加载器去查（即系统类加载器AppClassLoader）
+                    clazz = super.findClass(name);
+                } catch (AccessControlException ace) {
+                    log.warn(sm.getString("webappClassLoader.securityException", name, ace.getMessage()), ace);
+                    throw new ClassNotFoundException(name, ace);
+                } catch (RuntimeException e) {
+                    if (log.isTraceEnabled()) {
+                        log.trace("      -->RuntimeException Rethrown", e);
+                    }
+                    throw e;
+                }
+            }
+            if (clazz == null) {
+                // 3. 如果⽗类也没找到，抛出ClassNotFoundException
+                if (log.isDebugEnabled()) {
+                    log.debug("    --> Returning ClassNotFoundException");
+                }
+                throw new ClassNotFoundException(name);
+            }
+        } catch (ClassNotFoundException e) {
+            if (log.isTraceEnabled()) {
+                log.trace("    --> Passing on ClassNotFoundException");
+            }
+            throw e;
+        }
+
+        // Return the class we have located
+        if (log.isTraceEnabled()) {
+            log.debug("      Returning class " + clazz);
+        }
+
+        if (log.isTraceEnabled()) {
+            ClassLoader cl;
+            if (Globals.IS_SECURITY_ENABLED) {
+                cl = AccessController.doPrivileged(new PrivilegedGetClassLoader(clazz));
+            } else {
+                cl = clazz.getClassLoader();
+            }
+            log.debug("      Loaded by " + cl.toString());
+        }
+        return clazz;
+
+    }
+
+    @Override
+    public Class<?> loadClass(String name) throws ClassNotFoundException {
+        return loadClass(name, false);
+    }
+    @Override
+    public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
+            if (log.isDebugEnabled()) {
+                log.debug("loadClass(" + name + ", " + resolve + ")");
+            }
+            Class<?> clazz = null;
+
+            // Log access to stopped class loader
+            checkStateForClassLoading(name);
+
+            // 1. 先在本地cache查找该类是否已经加载过 clazz
+            clazz = findLoadedClass0(name);
+            if (clazz != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("  Returning class from cache");
+                }
+                if (resolve) {
+                    resolveClass(clazz);
+                }
+                return clazz;
+            }
+
+            // 2. 从系统类加载器的cache中查找是否加载过
+            clazz = JreCompat.isGraalAvailable() ? null : findLoadedClass(name);
+            if (clazz != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("  Returning class from cache");
+                }
+                if (resolve) {
+                    resolveClass(clazz);
+                }
+                return clazz;
+            }
+
+            // 3. 尝试⽤ExtClassLoader类加载器类加载，为什么？
+            String resourceName = binaryNameToPath(name, false);
+            ClassLoader javaseLoader = getJavaseClassLoader();
+            boolean tryLoadingFromJavaseLoader;
+            try {
+                URL url;
+                if (securityManager != null) {
+                    PrivilegedAction<URL> dp = new PrivilegedJavaseGetResource(resourceName);
+                    url = AccessController.doPrivileged(dp);
+                } else {
+                    url = javaseLoader.getResource(resourceName);
+                }
+                tryLoadingFromJavaseLoader = url != null;
+            } catch (Throwable t) {
+                // Swallow all exceptions apart from those that must be re-thrown
+                ExceptionUtils.handleThrowable(t);
+                // The getResource() trick won't work for this class. We have to
+                // try loading it directly and accept that we might get a
+                // ClassNotFoundException.
+                tryLoadingFromJavaseLoader = true;
+            }
+
+            if (tryLoadingFromJavaseLoader) {
+                try {
+                    clazz = javaseLoader.loadClass(name);
+                    if (clazz != null) {
+                        if (resolve) {
+                            resolveClass(clazz);
+                        }
+                        return clazz;
+                    }
+                } catch (ClassNotFoundException e) {
+                    // Ignore
+                }
+            }
+
+            // (0.5) Permission to access this class when using a SecurityManager
+            if (securityManager != null) {
+                int i = name.lastIndexOf('.');
+                if (i >= 0) {
+                    try {
+                        securityManager.checkPackageAccess(name.substring(0, i));
+                    } catch (SecurityException se) {
+                        String error = sm.getString("webappClassLoader.restrictedPackage", name);
+                        log.info(error, se);
+                        throw new ClassNotFoundException(error, se);
+                    }
+                }
+            }
+
+            boolean delegateLoad = delegate || filter(name, true);
+
+            // (1) Delegate to our parent if requested
+            if (delegateLoad) {
+                if (log.isDebugEnabled()) {
+                    log.debug("  Delegating to parent classloader1 " + parent);
+                }
+                try {
+                    clazz = Class.forName(name, false, parent);
+                    if (clazz != null) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("  Loading class from parent");
+                        }
+                        if (resolve) {
+                            resolveClass(clazz);
+                        }
+                        return clazz;
+                    }
+                } catch (ClassNotFoundException e) {
+                    // Ignore
+                }
+            }
+
+            // (2) Search local repositories
+            if (log.isDebugEnabled()) {
+                log.debug("  Searching local repositories");
+            }
+            try {
+                //  4. 尝试在本地⽬录搜索class并加载
+                clazz = findClass(name);
+                if (clazz != null) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("  Loading class from local repository");
+                    }
+                    if (resolve) {
+                        resolveClass(clazz);
+                    }
+                    return clazz;
+                }
+            } catch (ClassNotFoundException e) {
+                // Ignore
+            }
+
+            // (3) Delegate to parent unconditionally
+            if (!delegateLoad) {
+                if (log.isDebugEnabled()) {
+                    log.debug("  Delegating to parent classloader at end: " + parent);
+                }
+                try {
+                    // 5. 尝试⽤系统类加载器(也就是AppClassLoader)来加载
+                    clazz = Class.forName(name, false, parent);
+                    if (clazz != null) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("  Loading class from parent");
+                        }
+                        if (resolve) {
+                            resolveClass(clazz);
+                        }
+                        return clazz;
+                    }
+                } catch (ClassNotFoundException e) {
+                    // Ignore
+                }
+            }
+        }
+
+        // 6. 上述过程都加载失败，抛出异常
+        throw new ClassNotFoundException(name);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    /**
+     * Find specified class in local repositories.
+     */
+    protected Class<?> findClassInternal(String name) {
+
+        checkStateForResourceLoading(name);
+
+        if (name == null) {
+            return null;
+        }
+        String path = binaryNameToPath(name, true);
+
+        ResourceEntry entry = resourceEntries.get(path);
+        WebResource resource = null;
+
+        if (entry == null) {
+            resource = resources.getClassLoaderResource(path);
+
+            if (!resource.exists()) {
+                return null;
+            }
+
+            entry = new ResourceEntry();
+            entry.lastModified = resource.getLastModified();
+
+            // Add the entry in the local resource repository
+            synchronized (resourceEntries) {
+                // Ensures that all the threads which may be in a race to load
+                // a particular class all end up with the same ResourceEntry
+                // instance
+                ResourceEntry entry2 = resourceEntries.get(path);
+                if (entry2 == null) {
+                    resourceEntries.put(path, entry);
+                } else {
+                    entry = entry2;
+                }
+            }
+        }
+
+        Class<?> clazz = entry.loadedClass;
+        if (clazz != null) {
+            return clazz;
+        }
+
+        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
+            clazz = entry.loadedClass;
+            if (clazz != null) {
+                return clazz;
+            }
+
+            if (resource == null) {
+                resource = resources.getClassLoaderResource(path);
+            }
+
+            if (!resource.exists()) {
+                return null;
+            }
+
+            byte[] binaryContent = resource.getContent();
+            if (binaryContent == null) {
+                // Something went wrong reading the class bytes (and will have
+                // been logged at debug level).
+                return null;
+            }
+            Manifest manifest = resource.getManifest();
+            URL codeBase = resource.getCodeBase();
+            Certificate[] certificates = resource.getCertificates();
+
+            if (transformers.size() > 0) {
+                // If the resource is a class just being loaded, decorate it
+                // with any attached transformers
+
+                // Ignore leading '/' and trailing CLASS_FILE_SUFFIX
+                // Should be cheaper than replacing '.' by '/' in class name.
+                String internalName = path.substring(1, path.length() - CLASS_FILE_SUFFIX.length());
+
+                for (ClassFileTransformer transformer : this.transformers) {
+                    try {
+                        byte[] transformed = transformer.transform(this, internalName, null, null, binaryContent);
+                        if (transformed != null) {
+                            binaryContent = transformed;
+                        }
+                    } catch (IllegalClassFormatException e) {
+                        log.error(sm.getString("webappClassLoader.transformError", name), e);
+                        return null;
+                    }
+                }
+            }
+
+            // Looking up the package
+            String packageName = null;
+            int pos = name.lastIndexOf('.');
+            if (pos != -1) {
+                packageName = name.substring(0, pos);
+            }
+
+            Package pkg = null;
+
+            if (packageName != null) {
+                pkg = getPackage(packageName);
+
+                // Define the package (if null)
+                if (pkg == null) {
+                    try {
+                        if (manifest == null) {
+                            definePackage(packageName, null, null, null, null, null, null, null);
+                        } else {
+                            definePackage(packageName, manifest, codeBase);
+                        }
+                    } catch (IllegalArgumentException e) {
+                        // Ignore: normal error due to dual definition of package
+                    }
+                    pkg = getPackage(packageName);
+                }
+            }
+
+            if (securityManager != null) {
+                // Checking sealing
+                if (pkg != null) {
+                    boolean sealCheck = true;
+                    if (pkg.isSealed()) {
+                        sealCheck = pkg.isSealed(codeBase);
+                    } else {
+                        sealCheck = manifest == null || !isPackageSealed(packageName, manifest);
+                    }
+                    if (!sealCheck) {
+                        throw new SecurityException(
+                            "Sealing violation loading " + name + " : Package " + packageName + " is sealed.");
+                    }
+                }
+            }
+
+            try {
+                clazz = defineClass(name, binaryContent, 0, binaryContent.length,
+                    new CodeSource(codeBase, certificates));
+            } catch (UnsupportedClassVersionError ucve) {
+                throw new UnsupportedClassVersionError(
+                    ucve.getLocalizedMessage() + " " + sm.getString("webappClassLoader.wrongVersion", name));
+            }
+            entry.loadedClass = clazz;
+        }
+
+        return clazz;
+    }
+
+
+
+
 
     /**
      * List of ThreadGroup names to ignore when scanning for web application started threads that need to be shut down.
@@ -219,11 +595,7 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
 
 
     /**
-     * Construct a new ClassLoader with no defined repositories and the given parent ClassLoader.
-     * <p>
-     * Method is used via reflection - see {@link WebappLoader#createClassLoader()}
-     *
-     * @param parent Our parent class loader
+     * 构造方法
      */
     protected WebappClassLoaderBase(ClassLoader parent) {
 
@@ -761,109 +1133,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     }
 
     /**
-     * Find the specified class in our local repositories, if possible. If not found, throw
-     * <code>ClassNotFoundException</code>.
-     *
-     * @param name The binary name of the class to be loaded
-     *
-     * @exception ClassNotFoundException if the class was not found
-     */
-    @Override
-    public Class<?> findClass(String name) throws ClassNotFoundException {
-
-        if (log.isDebugEnabled()) {
-            log.debug("    findClass(" + name + ")");
-        }
-
-        checkStateForClassLoading(name);
-
-        // (1) Permission to define this class when using a SecurityManager
-        if (securityManager != null) {
-            int i = name.lastIndexOf('.');
-            if (i >= 0) {
-                try {
-                    if (log.isTraceEnabled()) {
-                        log.trace("      securityManager.checkPackageDefinition");
-                    }
-                    securityManager.checkPackageDefinition(name.substring(0, i));
-                } catch (Exception se) {
-                    if (log.isTraceEnabled()) {
-                        log.trace("      -->Exception-->ClassNotFoundException", se);
-                    }
-                    throw new ClassNotFoundException(name, se);
-                }
-            }
-        }
-
-        // Ask our superclass to locate this class, if possible
-        // (throws ClassNotFoundException if it is not found)
-        Class<?> clazz = null;
-        try {
-            if (log.isTraceEnabled()) {
-                log.trace("      findClassInternal(" + name + ")");
-            }
-            try {
-                if (securityManager != null) {
-                    PrivilegedAction<Class<?>> dp = new PrivilegedFindClassByName(name);
-                    clazz = AccessController.doPrivileged(dp);
-                } else {
-                    clazz = findClassInternal(name);
-                }
-            } catch (AccessControlException ace) {
-                log.warn(sm.getString("webappClassLoader.securityException", name, ace.getMessage()), ace);
-                throw new ClassNotFoundException(name, ace);
-            } catch (RuntimeException e) {
-                if (log.isTraceEnabled()) {
-                    log.trace("      -->RuntimeException Rethrown", e);
-                }
-                throw e;
-            }
-            if (clazz == null && hasExternalRepositories) {
-                try {
-                    clazz = super.findClass(name);
-                } catch (AccessControlException ace) {
-                    log.warn(sm.getString("webappClassLoader.securityException", name, ace.getMessage()), ace);
-                    throw new ClassNotFoundException(name, ace);
-                } catch (RuntimeException e) {
-                    if (log.isTraceEnabled()) {
-                        log.trace("      -->RuntimeException Rethrown", e);
-                    }
-                    throw e;
-                }
-            }
-            if (clazz == null) {
-                if (log.isDebugEnabled()) {
-                    log.debug("    --> Returning ClassNotFoundException");
-                }
-                throw new ClassNotFoundException(name);
-            }
-        } catch (ClassNotFoundException e) {
-            if (log.isTraceEnabled()) {
-                log.trace("    --> Passing on ClassNotFoundException");
-            }
-            throw e;
-        }
-
-        // Return the class we have located
-        if (log.isTraceEnabled()) {
-            log.debug("      Returning class " + clazz);
-        }
-
-        if (log.isTraceEnabled()) {
-            ClassLoader cl;
-            if (Globals.IS_SECURITY_ENABLED) {
-                cl = AccessController.doPrivileged(new PrivilegedGetClassLoader(clazz));
-            } else {
-                cl = clazz.getClassLoader();
-            }
-            log.debug("      Loaded by " + cl.toString());
-        }
-        return clazz;
-
-    }
-
-
-    /**
      * Find the specified resource in our local repository, and return a <code>URL</code> referring to it, or
      * <code>null</code> if this resource cannot be found.
      *
@@ -1125,208 +1394,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
             log.debug("  --> Resource not found, returning null");
         }
         return null;
-    }
-
-
-    /**
-     * Load the class with the specified name. This method searches for classes in the same manner as
-     * <code>loadClass(String, boolean)</code> with <code>false</code> as the second argument.
-     *
-     * @param name The binary name of the class to be loaded
-     *
-     * @exception ClassNotFoundException if the class was not found
-     */
-    @Override
-    public Class<?> loadClass(String name) throws ClassNotFoundException {
-        return loadClass(name, false);
-    }
-
-
-    /**
-     * Load the class with the specified name, searching using the following algorithm until it finds and returns the
-     * class. If the class cannot be found, returns <code>ClassNotFoundException</code>.
-     * <ul>
-     * <li>Call <code>findLoadedClass(String)</code> to check if the class has already been loaded. If it has, the same
-     * <code>Class</code> object is returned.</li>
-     * <li>If the <code>delegate</code> property is set to <code>true</code>, call the <code>loadClass()</code> method
-     * of the parent class loader, if any.</li>
-     * <li>Call <code>findClass()</code> to find this class in our locally defined repositories.</li>
-     * <li>Call the <code>loadClass()</code> method of our parent class loader, if any.</li>
-     * </ul>
-     * If the class was found using the above steps, and the <code>resolve</code> flag is <code>true</code>, this method
-     * will then call <code>resolveClass(Class)</code> on the resulting Class object.
-     *
-     * @param name    The binary name of the class to be loaded
-     * @param resolve If <code>true</code> then resolve the class
-     *
-     * @exception ClassNotFoundException if the class was not found
-     */
-    @Override
-    public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
-
-        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
-            if (log.isDebugEnabled()) {
-                log.debug("loadClass(" + name + ", " + resolve + ")");
-            }
-            Class<?> clazz = null;
-
-            // Log access to stopped class loader
-            checkStateForClassLoading(name);
-
-            // (0) Check our previously loaded local class cache
-            clazz = findLoadedClass0(name);
-            if (clazz != null) {
-                if (log.isDebugEnabled()) {
-                    log.debug("  Returning class from cache");
-                }
-                if (resolve) {
-                    resolveClass(clazz);
-                }
-                return clazz;
-            }
-
-            // (0.1) Check our previously loaded class cache
-            clazz = JreCompat.isGraalAvailable() ? null : findLoadedClass(name);
-            if (clazz != null) {
-                if (log.isDebugEnabled()) {
-                    log.debug("  Returning class from cache");
-                }
-                if (resolve) {
-                    resolveClass(clazz);
-                }
-                return clazz;
-            }
-
-            /*
-             * (0.2) Try loading the class with the bootstrap class loader, to prevent the webapp from overriding Java
-             * SE classes. This implements SRV.10.7.2
-             */
-            String resourceName = binaryNameToPath(name, false);
-
-            ClassLoader javaseLoader = getJavaseClassLoader();
-            boolean tryLoadingFromJavaseLoader;
-            try {
-                /*
-                 * Use getResource as it won't trigger an expensive ClassNotFoundException if the resource is not
-                 * available from the Java SE class loader. However (see
-                 * https://bz.apache.org/bugzilla/show_bug.cgi?id=58125 for details) when running under a security
-                 * manager in rare cases this call may trigger a ClassCircularityError.
-                 *
-                 * See https://bz.apache.org/bugzilla/show_bug.cgi?id=61424 for details of how this may trigger a
-                 * StackOverflowError.
-                 *
-                 * Given these reported errors, catch Throwable to ensure all edge cases are caught.
-                 */
-                URL url;
-                if (securityManager != null) {
-                    PrivilegedAction<URL> dp = new PrivilegedJavaseGetResource(resourceName);
-                    url = AccessController.doPrivileged(dp);
-                } else {
-                    url = javaseLoader.getResource(resourceName);
-                }
-                tryLoadingFromJavaseLoader = url != null;
-            } catch (Throwable t) {
-                // Swallow all exceptions apart from those that must be re-thrown
-                ExceptionUtils.handleThrowable(t);
-                // The getResource() trick won't work for this class. We have to
-                // try loading it directly and accept that we might get a
-                // ClassNotFoundException.
-                tryLoadingFromJavaseLoader = true;
-            }
-
-            if (tryLoadingFromJavaseLoader) {
-                try {
-                    clazz = javaseLoader.loadClass(name);
-                    if (clazz != null) {
-                        if (resolve) {
-                            resolveClass(clazz);
-                        }
-                        return clazz;
-                    }
-                } catch (ClassNotFoundException e) {
-                    // Ignore
-                }
-            }
-
-            // (0.5) Permission to access this class when using a SecurityManager
-            if (securityManager != null) {
-                int i = name.lastIndexOf('.');
-                if (i >= 0) {
-                    try {
-                        securityManager.checkPackageAccess(name.substring(0, i));
-                    } catch (SecurityException se) {
-                        String error = sm.getString("webappClassLoader.restrictedPackage", name);
-                        log.info(error, se);
-                        throw new ClassNotFoundException(error, se);
-                    }
-                }
-            }
-
-            boolean delegateLoad = delegate || filter(name, true);
-
-            // (1) Delegate to our parent if requested
-            if (delegateLoad) {
-                if (log.isDebugEnabled()) {
-                    log.debug("  Delegating to parent classloader1 " + parent);
-                }
-                try {
-                    clazz = Class.forName(name, false, parent);
-                    if (clazz != null) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("  Loading class from parent");
-                        }
-                        if (resolve) {
-                            resolveClass(clazz);
-                        }
-                        return clazz;
-                    }
-                } catch (ClassNotFoundException e) {
-                    // Ignore
-                }
-            }
-
-            // (2) Search local repositories
-            if (log.isDebugEnabled()) {
-                log.debug("  Searching local repositories");
-            }
-            try {
-                clazz = findClass(name);
-                if (clazz != null) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("  Loading class from local repository");
-                    }
-                    if (resolve) {
-                        resolveClass(clazz);
-                    }
-                    return clazz;
-                }
-            } catch (ClassNotFoundException e) {
-                // Ignore
-            }
-
-            // (3) Delegate to parent unconditionally
-            if (!delegateLoad) {
-                if (log.isDebugEnabled()) {
-                    log.debug("  Delegating to parent classloader at end: " + parent);
-                }
-                try {
-                    clazz = Class.forName(name, false, parent);
-                    if (clazz != null) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("  Loading class from parent");
-                        }
-                        if (resolve) {
-                            resolveClass(clazz);
-                        }
-                        return clazz;
-                    }
-                } catch (ClassNotFoundException e) {
-                    // Ignore
-                }
-            }
-        }
-
-        throw new ClassNotFoundException(name);
     }
 
 
@@ -2197,154 +2264,6 @@ public abstract class WebappClassLoaderBase extends URLClassLoader
     }
 
 
-    /**
-     * Find specified class in local repositories.
-     *
-     * @param name The binary name of the class to be loaded
-     *
-     * @return the loaded class, or null if the class isn't found
-     */
-    protected Class<?> findClassInternal(String name) {
-
-        checkStateForResourceLoading(name);
-
-        if (name == null) {
-            return null;
-        }
-        String path = binaryNameToPath(name, true);
-
-        ResourceEntry entry = resourceEntries.get(path);
-        WebResource resource = null;
-
-        if (entry == null) {
-            resource = resources.getClassLoaderResource(path);
-
-            if (!resource.exists()) {
-                return null;
-            }
-
-            entry = new ResourceEntry();
-            entry.lastModified = resource.getLastModified();
-
-            // Add the entry in the local resource repository
-            synchronized (resourceEntries) {
-                // Ensures that all the threads which may be in a race to load
-                // a particular class all end up with the same ResourceEntry
-                // instance
-                ResourceEntry entry2 = resourceEntries.get(path);
-                if (entry2 == null) {
-                    resourceEntries.put(path, entry);
-                } else {
-                    entry = entry2;
-                }
-            }
-        }
-
-        Class<?> clazz = entry.loadedClass;
-        if (clazz != null) {
-            return clazz;
-        }
-
-        synchronized (JreCompat.isGraalAvailable() ? this : getClassLoadingLock(name)) {
-            clazz = entry.loadedClass;
-            if (clazz != null) {
-                return clazz;
-            }
-
-            if (resource == null) {
-                resource = resources.getClassLoaderResource(path);
-            }
-
-            if (!resource.exists()) {
-                return null;
-            }
-
-            byte[] binaryContent = resource.getContent();
-            if (binaryContent == null) {
-                // Something went wrong reading the class bytes (and will have
-                // been logged at debug level).
-                return null;
-            }
-            Manifest manifest = resource.getManifest();
-            URL codeBase = resource.getCodeBase();
-            Certificate[] certificates = resource.getCertificates();
-
-            if (transformers.size() > 0) {
-                // If the resource is a class just being loaded, decorate it
-                // with any attached transformers
-
-                // Ignore leading '/' and trailing CLASS_FILE_SUFFIX
-                // Should be cheaper than replacing '.' by '/' in class name.
-                String internalName = path.substring(1, path.length() - CLASS_FILE_SUFFIX.length());
-
-                for (ClassFileTransformer transformer : this.transformers) {
-                    try {
-                        byte[] transformed = transformer.transform(this, internalName, null, null, binaryContent);
-                        if (transformed != null) {
-                            binaryContent = transformed;
-                        }
-                    } catch (IllegalClassFormatException e) {
-                        log.error(sm.getString("webappClassLoader.transformError", name), e);
-                        return null;
-                    }
-                }
-            }
-
-            // Looking up the package
-            String packageName = null;
-            int pos = name.lastIndexOf('.');
-            if (pos != -1) {
-                packageName = name.substring(0, pos);
-            }
-
-            Package pkg = null;
-
-            if (packageName != null) {
-                pkg = getPackage(packageName);
-
-                // Define the package (if null)
-                if (pkg == null) {
-                    try {
-                        if (manifest == null) {
-                            definePackage(packageName, null, null, null, null, null, null, null);
-                        } else {
-                            definePackage(packageName, manifest, codeBase);
-                        }
-                    } catch (IllegalArgumentException e) {
-                        // Ignore: normal error due to dual definition of package
-                    }
-                    pkg = getPackage(packageName);
-                }
-            }
-
-            if (securityManager != null) {
-                // Checking sealing
-                if (pkg != null) {
-                    boolean sealCheck = true;
-                    if (pkg.isSealed()) {
-                        sealCheck = pkg.isSealed(codeBase);
-                    } else {
-                        sealCheck = manifest == null || !isPackageSealed(packageName, manifest);
-                    }
-                    if (!sealCheck) {
-                        throw new SecurityException(
-                                "Sealing violation loading " + name + " : Package " + packageName + " is sealed.");
-                    }
-                }
-            }
-
-            try {
-                clazz = defineClass(name, binaryContent, 0, binaryContent.length,
-                        new CodeSource(codeBase, certificates));
-            } catch (UnsupportedClassVersionError ucve) {
-                throw new UnsupportedClassVersionError(
-                        ucve.getLocalizedMessage() + " " + sm.getString("webappClassLoader.wrongVersion", name));
-            }
-            entry.loadedClass = clazz;
-        }
-
-        return clazz;
-    }
 
 
     private String binaryNameToPath(String binaryName, boolean withLeadingSlash) {
