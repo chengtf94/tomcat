@@ -1,19 +1,3 @@
-/*
- *  Licensed to the Apache Software Foundation (ASF) under one or more
- *  contributor license agreements.  See the NOTICE file distributed with
- *  this work for additional information regarding copyright ownership.
- *  The ASF licenses this file to You under the Apache License, Version 2.0
- *  (the "License"); you may not use this file except in compliance with
- *  the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
 package org.apache.coyote;
 
 import java.io.IOException;
@@ -103,28 +87,9 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler, MBeanRegis
 
     // ----------------------------------------------- Generic property handling
 
-    /**
-     * Generic property setter used by the digester. Other code should not need to use this. The digester will only use
-     * this method if it can't find a more specific setter. That means the property belongs to the Endpoint, the
-     * ServerSocketFactory or some other lower level component. This method ensures that it is visible to both.
-     *
-     * @param name  The name of the property to set
-     * @param value The value, in string form, to set for the property
-     *
-     * @return <code>true</code> if the property was set successfully, otherwise <code>false</code>
-     */
     public boolean setProperty(String name, String value) {
         return endpoint.setProperty(name, value);
     }
-
-
-    /**
-     * Generic property getter used by the digester. Other code should not need to use this.
-     *
-     * @param name The name of the property to get
-     *
-     * @return The value of the property converted to a string
-     */
     public String getProperty(String name) {
         return endpoint.getProperty(name);
     }
@@ -155,7 +120,6 @@ public abstract class AbstractProtocol<S> implements ProtocolHandler, MBeanRegis
     public Adapter getAdapter() {
         return adapter;
     }
-
 
     /**
      * The maximum number of idle processors that will be retained in the cache and re-used with a subsequent request.

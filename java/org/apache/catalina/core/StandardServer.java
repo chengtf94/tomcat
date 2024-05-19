@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 import java.beans.PropertyChangeListener;
@@ -60,7 +44,6 @@ import org.apache.tomcat.util.modeler.Registry;
 import org.apache.tomcat.util.res.StringManager;
 import org.apache.tomcat.util.threads.TaskThreadFactory;
 
-
 /**
  * Standard implementation of the <b>Server</b> interface, available for use (but not required) when deploying and
  * starting Catalina.
@@ -68,31 +51,188 @@ import org.apache.tomcat.util.threads.TaskThreadFactory;
  * @author Craig R. McClanahan
  */
 public final class StandardServer extends LifecycleMBeanBase implements Server {
-
     private static final Log log = LogFactory.getLog(StandardServer.class);
     private static final StringManager sm = StringManager.getManager(StandardServer.class);
 
-
-    // ------------------------------------------------------------ Constructor
-
     /**
-     * Construct a default instance of this class.
+     * 构造方法
      */
     public StandardServer() {
-
         super();
-
         globalNamingResources = new NamingResourcesImpl();
         globalNamingResources.setContainer(this);
-
         if (isUseNaming()) {
             namingContextListener = new NamingContextListener();
             addLifecycleListener(namingContextListener);
         } else {
             namingContextListener = null;
         }
-
     }
+
+    /**
+     * The set of Services associated with this Server.
+     */
+    private Service[] services = new Service[0];
+    private final Object servicesLock = new Object();
+
+    @Override
+    public void addService(Service service) {
+        service.setServer(this);
+        synchronized (servicesLock) {
+            // 创建⼀个⻓度+1的新数组
+            Service results[] = new Service[services.length + 1];
+            // 将⽼的数据复制过去
+            System.arraycopy(services, 0, results, 0, services.length);
+            results[services.length] = service;
+            services = results;
+            // 启动Service组件
+            if (getState().isAvailable()) {
+                try {
+                    service.start();
+                } catch (LifecycleException e) {
+                }
+            }
+            // 触发监听事件
+            support.firePropertyChange("service", null, service);
+        }
+    }
+
+    /**
+     * 创建⼀个Socket监听8005端⼝，并在⼀个死循环⾥接收Socket上的连接请求，如果有新的连接到来就建⽴连接，然后从Socket中读取数据；
+     * 如果读到的数据是停⽌命令“SHUTDOWN”，就退出循环，进⼊stop流程。
+     */
+    @Override
+    public void await() {
+        // Negative values - don't wait on port - tomcat is embedded or we just don't like ports
+        if (getPortWithOffset() == -2) {
+            // undocumented yet - for embedding apps that are around, alive.
+            return;
+        }
+        Thread currentThread = Thread.currentThread();
+        if (getPortWithOffset() == -1) {
+            try {
+                awaitThread = currentThread;
+                while (!stopAwait) {
+                    try {
+                        Thread.sleep(10000);
+                    } catch (InterruptedException ex) {
+                        // continue and check the flag
+                    }
+                }
+            } finally {
+                awaitThread = null;
+            }
+            return;
+        }
+
+        // Set up a server socket to wait on
+        try {
+            awaitSocket = new ServerSocket(getPortWithOffset(), 1, InetAddress.getByName(address));
+        } catch (IOException e) {
+            log.error(sm.getString("standardServer.awaitSocket.fail", address, String.valueOf(getPortWithOffset()),
+                String.valueOf(getPort()), String.valueOf(getPortOffset())), e);
+            return;
+        }
+
+        try {
+            awaitThread = currentThread;
+
+            // Loop waiting for a connection and a valid command
+            while (!stopAwait) {
+                ServerSocket serverSocket = awaitSocket;
+                if (serverSocket == null) {
+                    break;
+                }
+
+                // Wait for the next connection
+                Socket socket = null;
+                StringBuilder command = new StringBuilder();
+                try {
+                    InputStream stream;
+                    long acceptStartTime = System.currentTimeMillis();
+                    try {
+                        socket = serverSocket.accept();
+                        socket.setSoTimeout(10 * 1000); // Ten seconds
+                        stream = socket.getInputStream();
+                    } catch (SocketTimeoutException ste) {
+                        // This should never happen but bug 56684 suggests that
+                        // it does.
+                        log.warn(sm.getString("standardServer.accept.timeout",
+                            Long.valueOf(System.currentTimeMillis() - acceptStartTime)), ste);
+                        continue;
+                    } catch (AccessControlException ace) {
+                        log.warn(sm.getString("standardServer.accept.security"), ace);
+                        continue;
+                    } catch (IOException e) {
+                        if (stopAwait) {
+                            // Wait was aborted with socket.close()
+                            break;
+                        }
+                        log.error(sm.getString("standardServer.accept.error"), e);
+                        break;
+                    }
+
+                    // Read a set of characters from the socket
+                    int expected = 1024; // Cut off to avoid DoS attack
+                    while (expected < shutdown.length()) {
+                        if (random == null) {
+                            random = new Random();
+                        }
+                        expected += random.nextInt() % 1024;
+                    }
+                    while (expected > 0) {
+                        int ch = -1;
+                        try {
+                            ch = stream.read();
+                        } catch (IOException e) {
+                            log.warn(sm.getString("standardServer.accept.readError"), e);
+                            ch = -1;
+                        }
+                        // Control character or EOF (-1) terminates loop
+                        if (ch < 32 || ch == 127) {
+                            break;
+                        }
+                        command.append((char) ch);
+                        expected--;
+                    }
+                } finally {
+                    // Close the socket now that we are done with it
+                    try {
+                        if (socket != null) {
+                            socket.close();
+                        }
+                    } catch (IOException e) {
+                        // Ignore
+                    }
+                }
+
+                // Match against our command string
+                boolean match = command.toString().equals(shutdown);
+                if (match) {
+                    log.info(sm.getString("standardServer.shutdownViaPort"));
+                    break;
+                } else {
+                    log.warn(sm.getString("standardServer.invalidShutdownCommand", command.toString()));
+                }
+            }
+        } finally {
+            ServerSocket serverSocket = awaitSocket;
+            awaitThread = null;
+            awaitSocket = null;
+
+            // Close the server socket and return
+            if (serverSocket != null) {
+                try {
+                    serverSocket.close();
+                } catch (IOException e) {
+                    // Ignore
+                }
+            }
+        }
+    }
+
+
+
 
 
     // ----------------------------------------------------- Instance Variables
@@ -135,12 +275,6 @@ public final class StandardServer extends LifecycleMBeanBase implements Server {
      */
     private Random random = null;
 
-
-    /**
-     * The set of Services associated with this Server.
-     */
-    private Service[] services = new Service[0];
-    private final Object servicesLock = new Object();
 
 
     /**
@@ -496,35 +630,7 @@ public final class StandardServer extends LifecycleMBeanBase implements Server {
     // --------------------------------------------------------- Server Methods
 
 
-    /**
-     * Add a new Service to the set of defined Services.
-     *
-     * @param service The Service to be added
-     */
-    @Override
-    public void addService(Service service) {
 
-        service.setServer(this);
-
-        synchronized (servicesLock) {
-            Service results[] = new Service[services.length + 1];
-            System.arraycopy(services, 0, results, 0, services.length);
-            results[services.length] = service;
-            services = results;
-
-            if (getState().isAvailable()) {
-                try {
-                    service.start();
-                } catch (LifecycleException e) {
-                    // Ignore
-                }
-            }
-
-            // Report this property change to interested listeners
-            support.firePropertyChange("service", null, service);
-        }
-
-    }
 
     public void stopAwait() {
         stopAwait = true;
@@ -548,139 +654,6 @@ public final class StandardServer extends LifecycleMBeanBase implements Server {
         }
     }
 
-    /**
-     * Wait until a proper shutdown command is received, then return. This keeps the main thread alive - the thread pool
-     * listening for http connections is daemon threads.
-     */
-    @Override
-    public void await() {
-        // Negative values - don't wait on port - tomcat is embedded or we just don't like ports
-        if (getPortWithOffset() == -2) {
-            // undocumented yet - for embedding apps that are around, alive.
-            return;
-        }
-        Thread currentThread = Thread.currentThread();
-        if (getPortWithOffset() == -1) {
-            try {
-                awaitThread = currentThread;
-                while (!stopAwait) {
-                    try {
-                        Thread.sleep(10000);
-                    } catch (InterruptedException ex) {
-                        // continue and check the flag
-                    }
-                }
-            } finally {
-                awaitThread = null;
-            }
-            return;
-        }
-
-        // Set up a server socket to wait on
-        try {
-            awaitSocket = new ServerSocket(getPortWithOffset(), 1, InetAddress.getByName(address));
-        } catch (IOException e) {
-            log.error(sm.getString("standardServer.awaitSocket.fail", address, String.valueOf(getPortWithOffset()),
-                    String.valueOf(getPort()), String.valueOf(getPortOffset())), e);
-            return;
-        }
-
-        try {
-            awaitThread = currentThread;
-
-            // Loop waiting for a connection and a valid command
-            while (!stopAwait) {
-                ServerSocket serverSocket = awaitSocket;
-                if (serverSocket == null) {
-                    break;
-                }
-
-                // Wait for the next connection
-                Socket socket = null;
-                StringBuilder command = new StringBuilder();
-                try {
-                    InputStream stream;
-                    long acceptStartTime = System.currentTimeMillis();
-                    try {
-                        socket = serverSocket.accept();
-                        socket.setSoTimeout(10 * 1000); // Ten seconds
-                        stream = socket.getInputStream();
-                    } catch (SocketTimeoutException ste) {
-                        // This should never happen but bug 56684 suggests that
-                        // it does.
-                        log.warn(sm.getString("standardServer.accept.timeout",
-                                Long.valueOf(System.currentTimeMillis() - acceptStartTime)), ste);
-                        continue;
-                    } catch (AccessControlException ace) {
-                        log.warn(sm.getString("standardServer.accept.security"), ace);
-                        continue;
-                    } catch (IOException e) {
-                        if (stopAwait) {
-                            // Wait was aborted with socket.close()
-                            break;
-                        }
-                        log.error(sm.getString("standardServer.accept.error"), e);
-                        break;
-                    }
-
-                    // Read a set of characters from the socket
-                    int expected = 1024; // Cut off to avoid DoS attack
-                    while (expected < shutdown.length()) {
-                        if (random == null) {
-                            random = new Random();
-                        }
-                        expected += random.nextInt() % 1024;
-                    }
-                    while (expected > 0) {
-                        int ch = -1;
-                        try {
-                            ch = stream.read();
-                        } catch (IOException e) {
-                            log.warn(sm.getString("standardServer.accept.readError"), e);
-                            ch = -1;
-                        }
-                        // Control character or EOF (-1) terminates loop
-                        if (ch < 32 || ch == 127) {
-                            break;
-                        }
-                        command.append((char) ch);
-                        expected--;
-                    }
-                } finally {
-                    // Close the socket now that we are done with it
-                    try {
-                        if (socket != null) {
-                            socket.close();
-                        }
-                    } catch (IOException e) {
-                        // Ignore
-                    }
-                }
-
-                // Match against our command string
-                boolean match = command.toString().equals(shutdown);
-                if (match) {
-                    log.info(sm.getString("standardServer.shutdownViaPort"));
-                    break;
-                } else {
-                    log.warn(sm.getString("standardServer.invalidShutdownCommand", command.toString()));
-                }
-            }
-        } finally {
-            ServerSocket serverSocket = awaitSocket;
-            awaitThread = null;
-            awaitSocket = null;
-
-            // Close the server socket and return
-            if (serverSocket != null) {
-                try {
-                    serverSocket.close();
-                } catch (IOException e) {
-                    // Ignore
-                }
-            }
-        }
-    }
 
 
     /**

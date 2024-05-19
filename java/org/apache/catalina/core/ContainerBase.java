@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 import java.beans.PropertyChangeListener;
@@ -66,64 +50,79 @@ import org.apache.tomcat.util.MultiThrowable;
 import org.apache.tomcat.util.res.StringManager;
 import org.apache.tomcat.util.threads.InlineExecutorService;
 
-
 /**
  * Abstract implementation of the <b>Container</b> interface, providing common functionality required by nearly every
  * implementation. Classes extending this base class must may implement a replacement for <code>invoke()</code>.
- * <p>
- * All subclasses of this abstract base class will include support for a Pipeline object that defines the processing to
- * be performed for each request received by the <code>invoke()</code> method of this class, utilizing the "Chain of
- * Responsibility" design pattern. A subclass should encapsulate its own processing functionality as a
- * <code>Valve</code>, and configure this Valve into the pipeline by calling <code>setBasic()</code>.
- * <p>
- * This implementation fires property change events, per the JavaBeans design pattern, for changes in singleton
- * properties. In addition, it fires the following <code>ContainerEvent</code> events to listeners who register
- * themselves with <code>addContainerListener()</code>:
- * <table border=1>
- * <caption>ContainerEvents fired by this implementation</caption>
- * <tr>
- * <th>Type</th>
- * <th>Data</th>
- * <th>Description</th>
- * </tr>
- * <tr>
- * <td><code>addChild</code></td>
- * <td><code>Container</code></td>
- * <td>Child container added to this Container.</td>
- * </tr>
- * <tr>
- * <td><code>{@link #getPipeline() pipeline}.addValve</code></td>
- * <td><code>Valve</code></td>
- * <td>Valve added to this Container.</td>
- * </tr>
- * <tr>
- * <td><code>removeChild</code></td>
- * <td><code>Container</code></td>
- * <td>Child container removed from this Container.</td>
- * </tr>
- * <tr>
- * <td><code>{@link #getPipeline() pipeline}.removeValve</code></td>
- * <td><code>Valve</code></td>
- * <td>Valve removed from this Container.</td>
- * </tr>
- * <tr>
- * <td><code>start</code></td>
- * <td><code>null</code></td>
- * <td>Container was started.</td>
- * </tr>
- * <tr>
- * <td><code>stop</code></td>
- * <td><code>null</code></td>
- * <td>Container was stopped.</td>
- * </tr>
- * </table>
- * Subclasses that fire additional events should document them in the class comments of the implementation class.
  *
  * @author Craig R. McClanahan
  */
 public abstract class ContainerBase extends LifecycleMBeanBase implements Container {
-
     private static final Log log = LogFactory.getLog(ContainerBase.class);
+
+    /** ⼦容器Map、启动或停止子容器的线程数、线程池 */
+    protected final HashMap<String,Container> children = new HashMap<>();
+    private int startStopThreads = 1;
+    protected ExecutorService startStopExecutor;
+
+    @Override
+    protected synchronized void startInternal() throws LifecycleException {
+
+        reconfigureStartStopExecutor(getStartStopThreads());
+
+        // Start our subordinate components, if any
+        logger = null;
+        getLogger();
+        Cluster cluster = getClusterInternal();
+        if (cluster instanceof Lifecycle) {
+            ((Lifecycle) cluster).start();
+        }
+        Realm realm = getRealmInternal();
+        if (realm instanceof Lifecycle) {
+            ((Lifecycle) realm).start();
+        }
+
+        // Start our child containers, if any
+        Container[] children = findChildren();
+        List<Future<Void>> results = new ArrayList<>(children.length);
+        for (Container child : children) {
+            results.add(startStopExecutor.submit(new StartChild(child)));
+        }
+
+        MultiThrowable multiThrowable = null;
+
+        for (Future<Void> result : results) {
+            try {
+                result.get();
+            } catch (Throwable e) {
+                log.error(sm.getString("containerBase.threadedStartFailed"), e);
+                if (multiThrowable == null) {
+                    multiThrowable = new MultiThrowable();
+                }
+                multiThrowable.add(e);
+            }
+
+        }
+        if (multiThrowable != null) {
+            throw new LifecycleException(sm.getString("containerBase.threadedStartFailed"),
+                multiThrowable.getThrowable());
+        }
+
+        // Start the Valves in our pipeline (including the basic), if any
+        if (pipeline instanceof Lifecycle) {
+            ((Lifecycle) pipeline).start();
+        }
+
+        setState(LifecycleState.STARTING);
+
+        // Start our thread
+        if (backgroundProcessorDelay > 0) {
+            monitorFuture = Container.getService(ContainerBase.this).getServer().getUtilityExecutor()
+                .scheduleWithFixedDelay(new ContainerBackgroundProcessorMonitor(), 0, 60, TimeUnit.SECONDS);
+        }
+    }
+
+
+
 
     /**
      * Perform addChild with the permissions of this class. addChild can be called with the XML parser on the stack,
@@ -148,10 +147,6 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
 
     // ----------------------------------------------------- Instance Variables
 
-    /**
-     * The child Containers belonging to this Container, keyed by name.
-     */
-    protected final HashMap<String,Container> children = new HashMap<>();
 
 
     /**
@@ -253,11 +248,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
     private volatile boolean accessLogScanComplete = false;
 
 
-    /**
-     * The number of threads available to process start and stop events for any children associated with this container.
-     */
-    private int startStopThreads = 1;
-    protected ExecutorService startStopExecutor;
+
 
 
     // ------------------------------------------------------------- Properties
@@ -831,71 +822,6 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
             Server server = Container.getService(this).getServer();
             server.setUtilityThreads(threads);
             startStopExecutor = server.getUtilityExecutor();
-        }
-    }
-
-
-    /**
-     * Start this component and implement the requirements of
-     * {@link org.apache.catalina.util.LifecycleBase#startInternal()}.
-     *
-     * @exception LifecycleException if this component detects a fatal error that prevents this component from being
-     *                                   used
-     */
-    @Override
-    protected synchronized void startInternal() throws LifecycleException {
-
-        reconfigureStartStopExecutor(getStartStopThreads());
-
-        // Start our subordinate components, if any
-        logger = null;
-        getLogger();
-        Cluster cluster = getClusterInternal();
-        if (cluster instanceof Lifecycle) {
-            ((Lifecycle) cluster).start();
-        }
-        Realm realm = getRealmInternal();
-        if (realm instanceof Lifecycle) {
-            ((Lifecycle) realm).start();
-        }
-
-        // Start our child containers, if any
-        Container[] children = findChildren();
-        List<Future<Void>> results = new ArrayList<>(children.length);
-        for (Container child : children) {
-            results.add(startStopExecutor.submit(new StartChild(child)));
-        }
-
-        MultiThrowable multiThrowable = null;
-
-        for (Future<Void> result : results) {
-            try {
-                result.get();
-            } catch (Throwable e) {
-                log.error(sm.getString("containerBase.threadedStartFailed"), e);
-                if (multiThrowable == null) {
-                    multiThrowable = new MultiThrowable();
-                }
-                multiThrowable.add(e);
-            }
-
-        }
-        if (multiThrowable != null) {
-            throw new LifecycleException(sm.getString("containerBase.threadedStartFailed"),
-                    multiThrowable.getThrowable());
-        }
-
-        // Start the Valves in our pipeline (including the basic), if any
-        if (pipeline instanceof Lifecycle) {
-            ((Lifecycle) pipeline).start();
-        }
-
-        setState(LifecycleState.STARTING);
-
-        // Start our thread
-        if (backgroundProcessorDelay > 0) {
-            monitorFuture = Container.getService(ContainerBase.this).getServer().getUtilityExecutor()
-                    .scheduleWithFixedDelay(new ContainerBackgroundProcessorMonitor(), 0, 60, TimeUnit.SECONDS);
         }
     }
 

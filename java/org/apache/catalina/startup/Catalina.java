@@ -1,21 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.startup;
-
 
 import java.io.File;
 import java.io.FileWriter;
@@ -53,35 +36,255 @@ import org.apache.tomcat.util.res.StringManager;
 import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 
-
 /**
- * Startup/Shutdown shell program for Catalina.  The following command line
- * options are recognized:
- * <ul>
- * <li><b>-config {pathname}</b> - Set the pathname of the configuration file
- *     to be processed.  If a relative path is specified, it will be
- *     interpreted as relative to the directory pathname specified by the
- *     "catalina.base" system property.   [conf/server.xml]</li>
- * <li><b>-help</b>      - Display usage information.</li>
- * <li><b>-nonaming</b>  - Disable naming support.</li>
- * <li><b>configtest</b> - Try to test the config</li>
- * <li><b>start</b>      - Start an instance of Catalina.</li>
- * <li><b>stop</b>       - Stop the currently running instance of Catalina.</li>
- * </ul>
+ * Startup/Shutdown shell program for Catalina.
  *
  * @author Craig R. McClanahan
  * @author Remy Maucherat
  */
 public class Catalina {
+    protected static final StringManager sm = StringManager.getManager(Constants.Package);
+    public static final String SERVER_XML = "conf/server.xml";
+
+    /**
+     * Start a new server instance.
+     */
+    public void start() {
+
+        // 1. 如果持有的Server实例为空，就解析server.xml创建出来
+        if (getServer() == null) {
+            load();
+        }
+
+        // 2. 如果创建失败，报错退出
+        if (getServer() == null) {
+            log.fatal(sm.getString("catalina.noServer"));
+            return;
+        }
+
+        long t1 = System.nanoTime();
+
+        // 3.启动Server
+        try {
+            getServer().start();
+        } catch (LifecycleException e) {
+            log.fatal(sm.getString("catalina.serverStartFail"), e);
+            try {
+                getServer().destroy();
+            } catch (LifecycleException e1) {
+                log.debug("destroy() failed for failed Server ", e1);
+            }
+            return;
+        }
+        if (log.isInfoEnabled()) {
+            log.info(sm.getString("catalina.startup", Long.toString(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1))));
+        }
+
+        if (generateCode) {
+            // Generate loader which will load all generated classes
+            generateLoader();
+        }
+
+        // 4.创建并注册关闭钩⼦：其实就是⼀个线程，JVM在停⽌之前会尝试执⾏这个线程的run⽅法
+        if (useShutdownHook) {
+            if (shutdownHook == null) {
+                shutdownHook = new CatalinaShutdownHook();
+            }
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
+            LogManager logManager = LogManager.getLogManager();
+            if (logManager instanceof ClassLoaderLogManager) {
+                ((ClassLoaderLogManager) logManager).setUseShutdownHook(
+                    false);
+            }
+        }
+
+        // 5.⽤await⽅法监听停⽌请求
+        if (await) {
+            await();
+            stop();
+        }
+    }
+
+    /**
+     * Start a new server instance.
+     */
+    public void load() {
+
+        if (loaded) {
+            return;
+        }
+        loaded = true;
+
+        long t1 = System.nanoTime();
+
+        initDirs();
+
+        // Before digester - it may be needed
+        initNaming();
+
+        // Parse main server.xml
+        parseServerXml(true);
+        Server s = getServer();
+        if (s == null) {
+            return;
+        }
+
+        getServer().setCatalina(this);
+        getServer().setCatalinaHome(Bootstrap.getCatalinaHomeFile());
+        getServer().setCatalinaBase(Bootstrap.getCatalinaBaseFile());
+
+        // Stream redirection
+        initStreams();
+
+        // Start the new server
+        try {
+            getServer().init();
+        } catch (LifecycleException e) {
+            if (Boolean.getBoolean("org.apache.catalina.startup.EXIT_ON_INIT_FAILURE")) {
+                throw new Error(e);
+            } else {
+                log.error(sm.getString("catalina.initError"), e);
+            }
+        }
+
+        if(log.isInfoEnabled()) {
+            log.info(sm.getString("catalina.init", Long.toString(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1))));
+        }
+    }
+
+    /**
+     * Shutdown hook which will perform a clean shutdown of Catalina if needed.
+     */
+    protected class CatalinaShutdownHook extends Thread {
+        @Override
+        public void run() {
+            try {
+                // Tomcat的“关闭钩⼦”实际上就执⾏了Server的stop⽅法，Server的stop⽅法会释放和清理所有的资源
+                if (getServer() != null) {
+                    Catalina.this.stop();
+                }
+            } catch (Throwable ex) {
+                ExceptionUtils.handleThrowable(ex);
+                log.error(sm.getString("catalina.shutdownHookFail"), ex);
+            } finally {
+                LogManager logManager = LogManager.getLogManager();
+                if (logManager instanceof ClassLoaderLogManager) {
+                    ((ClassLoaderLogManager) logManager).shutdown();
+                }
+            }
+        }
+    }
+
+    /**
+     * Await and shutdown.
+     */
+    public void await() {
+        getServer().await();
+    }
+
+    /**
+     * Stop an existing server instance.
+     */
+    public void stop() {
+
+        try {
+            // Remove the ShutdownHook first so that server.stop()
+            // doesn't get invoked twice
+            if (useShutdownHook) {
+                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+
+                // If JULI is being used, re-enable JULI's shutdown to ensure
+                // log messages are not lost
+                LogManager logManager = LogManager.getLogManager();
+                if (logManager instanceof ClassLoaderLogManager) {
+                    ((ClassLoaderLogManager) logManager).setUseShutdownHook(
+                        true);
+                }
+            }
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            // This will fail on JDK 1.2. Ignoring, as Tomcat can run
+            // fine without the shutdown hook.
+        }
+
+        // Shut down the server
+        try {
+            Server s = getServer();
+            LifecycleState state = s.getState();
+            if (LifecycleState.STOPPING_PREP.compareTo(state) <= 0
+                && LifecycleState.DESTROYED.compareTo(state) >= 0) {
+                // Nothing to do. stop() was already called
+            } else {
+                s.stop();
+                s.destroy();
+            }
+        } catch (LifecycleException e) {
+            log.error(sm.getString("catalina.stopError"), e);
+        }
+
+    }
+
+
+
+
+
 
 
     /**
-     * The string manager for this package.
+     * Process the specified command line arguments.
+     *
+     * @param args Command line arguments to process
+     * @return <code>true</code> if we should continue processing
      */
-    protected static final StringManager sm =
-        StringManager.getManager(Constants.Package);
+    protected boolean arguments(String args[]) {
 
-    public static final String SERVER_XML = "conf/server.xml";
+        boolean isConfig = false;
+        boolean isGenerateCode = false;
+
+        if (args.length < 1) {
+            usage();
+            return false;
+        }
+
+        for (String arg : args) {
+            if (isConfig) {
+                configFile = arg;
+                isConfig = false;
+            } else if (arg.equals("-config")) {
+                isConfig = true;
+            } else if (arg.equals("-generateCode")) {
+                setGenerateCode(true);
+                isGenerateCode = true;
+            } else if (arg.equals("-useGeneratedCode")) {
+                setUseGeneratedCode(true);
+                isGenerateCode = false;
+            } else if (arg.equals("-nonaming")) {
+                setUseNaming(false);
+                isGenerateCode = false;
+            } else if (arg.equals("-help")) {
+                usage();
+                return false;
+            } else if (arg.equals("start")) {
+                isGenerateCode = false;
+                // NOOP
+            } else if (arg.equals("configtest")) {
+                isGenerateCode = false;
+                // NOOP
+            } else if (arg.equals("stop")) {
+                isGenerateCode = false;
+                // NOOP
+            } else if (isGenerateCode) {
+                generatedCodeLocationParameter = arg;
+                isGenerateCode = false;
+            } else {
+                usage();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
 
     // ----------------------------------------------------- Instance Variables
 
@@ -235,13 +438,10 @@ public class Catalina {
 
     /**
      * Set the shared extensions class loader.
-     *
-     * @param parentClassLoader The shared extensions class loader.
      */
     public void setParentClassLoader(ClassLoader parentClassLoader) {
         this.parentClassLoader = parentClassLoader;
     }
-
     public ClassLoader getParentClassLoader() {
         if (parentClassLoader != null) {
             return parentClassLoader;
@@ -285,62 +485,6 @@ public class Catalina {
     }
 
     // ------------------------------------------------------ Protected Methods
-
-
-    /**
-     * Process the specified command line arguments.
-     *
-     * @param args Command line arguments to process
-     * @return <code>true</code> if we should continue processing
-     */
-    protected boolean arguments(String args[]) {
-
-        boolean isConfig = false;
-        boolean isGenerateCode = false;
-
-        if (args.length < 1) {
-            usage();
-            return false;
-        }
-
-        for (String arg : args) {
-            if (isConfig) {
-                configFile = arg;
-                isConfig = false;
-            } else if (arg.equals("-config")) {
-                isConfig = true;
-            } else if (arg.equals("-generateCode")) {
-                setGenerateCode(true);
-                isGenerateCode = true;
-            } else if (arg.equals("-useGeneratedCode")) {
-                setUseGeneratedCode(true);
-                isGenerateCode = false;
-            } else if (arg.equals("-nonaming")) {
-                setUseNaming(false);
-                isGenerateCode = false;
-            } else if (arg.equals("-help")) {
-                usage();
-                return false;
-            } else if (arg.equals("start")) {
-                isGenerateCode = false;
-                // NOOP
-            } else if (arg.equals("configtest")) {
-                isGenerateCode = false;
-                // NOOP
-            } else if (arg.equals("stop")) {
-                isGenerateCode = false;
-                // NOOP
-            } else if (isGenerateCode) {
-                generatedCodeLocationParameter = arg;
-                isGenerateCode = false;
-            } else {
-                usage();
-                return false;
-            }
-        }
-
-        return true;
-    }
 
 
     /**
@@ -688,52 +832,7 @@ public class Catalina {
     }
 
 
-    /**
-     * Start a new server instance.
-     */
-    public void load() {
 
-        if (loaded) {
-            return;
-        }
-        loaded = true;
-
-        long t1 = System.nanoTime();
-
-        initDirs();
-
-        // Before digester - it may be needed
-        initNaming();
-
-        // Parse main server.xml
-        parseServerXml(true);
-        Server s = getServer();
-        if (s == null) {
-            return;
-        }
-
-        getServer().setCatalina(this);
-        getServer().setCatalinaHome(Bootstrap.getCatalinaHomeFile());
-        getServer().setCatalinaBase(Bootstrap.getCatalinaBaseFile());
-
-        // Stream redirection
-        initStreams();
-
-        // Start the new server
-        try {
-            getServer().init();
-        } catch (LifecycleException e) {
-            if (Boolean.getBoolean("org.apache.catalina.startup.EXIT_ON_INIT_FAILURE")) {
-                throw new Error(e);
-            } else {
-                log.error(sm.getString("catalina.initError"), e);
-            }
-        }
-
-        if(log.isInfoEnabled()) {
-            log.info(sm.getString("catalina.init", Long.toString(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1))));
-        }
-    }
 
 
     /*
@@ -751,119 +850,9 @@ public class Catalina {
     }
 
 
-    /**
-     * Start a new server instance.
-     */
-    public void start() {
-
-        if (getServer() == null) {
-            load();
-        }
-
-        if (getServer() == null) {
-            log.fatal(sm.getString("catalina.noServer"));
-            return;
-        }
-
-        long t1 = System.nanoTime();
-
-        // Start the new server
-        try {
-            getServer().start();
-        } catch (LifecycleException e) {
-            log.fatal(sm.getString("catalina.serverStartFail"), e);
-            try {
-                getServer().destroy();
-            } catch (LifecycleException e1) {
-                log.debug("destroy() failed for failed Server ", e1);
-            }
-            return;
-        }
-
-        if (log.isInfoEnabled()) {
-            log.info(sm.getString("catalina.startup", Long.toString(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1))));
-        }
-
-        if (generateCode) {
-            // Generate loader which will load all generated classes
-            generateLoader();
-        }
-
-        // Register shutdown hook
-        if (useShutdownHook) {
-            if (shutdownHook == null) {
-                shutdownHook = new CatalinaShutdownHook();
-            }
-            Runtime.getRuntime().addShutdownHook(shutdownHook);
-
-            // If JULI is being used, disable JULI's shutdown hook since
-            // shutdown hooks run in parallel and log messages may be lost
-            // if JULI's hook completes before the CatalinaShutdownHook()
-            LogManager logManager = LogManager.getLogManager();
-            if (logManager instanceof ClassLoaderLogManager) {
-                ((ClassLoaderLogManager) logManager).setUseShutdownHook(
-                        false);
-            }
-        }
-
-        if (await) {
-            await();
-            stop();
-        }
-    }
 
 
-    /**
-     * Stop an existing server instance.
-     */
-    public void stop() {
 
-        try {
-            // Remove the ShutdownHook first so that server.stop()
-            // doesn't get invoked twice
-            if (useShutdownHook) {
-                Runtime.getRuntime().removeShutdownHook(shutdownHook);
-
-                // If JULI is being used, re-enable JULI's shutdown to ensure
-                // log messages are not lost
-                LogManager logManager = LogManager.getLogManager();
-                if (logManager instanceof ClassLoaderLogManager) {
-                    ((ClassLoaderLogManager) logManager).setUseShutdownHook(
-                            true);
-                }
-            }
-        } catch (Throwable t) {
-            ExceptionUtils.handleThrowable(t);
-            // This will fail on JDK 1.2. Ignoring, as Tomcat can run
-            // fine without the shutdown hook.
-        }
-
-        // Shut down the server
-        try {
-            Server s = getServer();
-            LifecycleState state = s.getState();
-            if (LifecycleState.STOPPING_PREP.compareTo(state) <= 0
-                    && LifecycleState.DESTROYED.compareTo(state) >= 0) {
-                // Nothing to do. stop() was already called
-            } else {
-                s.stop();
-                s.destroy();
-            }
-        } catch (LifecycleException e) {
-            log.error(sm.getString("catalina.stopError"), e);
-        }
-
-    }
-
-
-    /**
-     * Await and shutdown.
-     */
-    public void await() {
-
-        getServer().await();
-
-    }
 
 
     /**
@@ -984,30 +973,7 @@ public class Catalina {
     // --------------------------------------- CatalinaShutdownHook Inner Class
 
     // XXX Should be moved to embedded !
-    /**
-     * Shutdown hook which will perform a clean shutdown of Catalina if needed.
-     */
-    protected class CatalinaShutdownHook extends Thread {
 
-        @Override
-        public void run() {
-            try {
-                if (getServer() != null) {
-                    Catalina.this.stop();
-                }
-            } catch (Throwable ex) {
-                ExceptionUtils.handleThrowable(ex);
-                log.error(sm.getString("catalina.shutdownHookFail"), ex);
-            } finally {
-                // If JULI is used, shut JULI down *after* the server shuts down
-                // so log messages aren't lost
-                LogManager logManager = LogManager.getLogManager();
-                if (logManager instanceof ClassLoaderLogManager) {
-                    ((ClassLoaderLogManager) logManager).shutdown();
-                }
-            }
-        }
-    }
 
 
     private static final Log log = LogFactory.getLog(Catalina.class);
