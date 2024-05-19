@@ -1,19 +1,3 @@
-/*
- *  Licensed to the Apache Software Foundation (ASF) under one or more
- *  contributor license agreements.  See the NOTICE file distributed with
- *  this work for additional information regarding copyright ownership.
- *  The ASF licenses this file to You under the Apache License, Version 2.0
- *  (the "License"); you may not use this file except in compliance with
- *  the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
 package org.apache.tomcat.util.threads;
 
 import java.util.Collection;
@@ -24,13 +8,47 @@ import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 
 /**
- * Shared latch that allows the latch to be acquired a limited number of times
- * after which all subsequent requests to acquire the latch will be placed in a
- * FIFO queue until one of the shares is returned.
+ * LimitLatch：连接控制器，负责控制最⼤连接数，NIO模式下默认是10000，达到这个阈值后，连接请求被拒绝。
+ * 当连接数到达最⼤时阻塞线程，直到后续组件处理完⼀个连接后将连接数减1。注意：到达最⼤连接数后操作系统底层还是会接收客户端连接，但⽤户层已经不再接收。
  */
 public class LimitLatch {
-
     private static final Log log = LogFactory.getLog(LimitLatch.class);
+
+    private final Sync sync;
+    private final AtomicLong count;
+    private volatile long limit;
+    private volatile boolean released = false;
+
+    /**
+     * 构造方法
+     */
+    public LimitLatch(long limit) {
+        this.limit = limit;
+        this.count = new AtomicLong(0);
+        this.sync = new Sync();
+    }
+
+    /**
+     * 线程调⽤这个⽅法来获得接收新连接的许可，线程可能被阻塞（如果暂时⽆法获取，这个线程会被阻塞到AQS的队列中）
+     */
+    public void countUpOrAwait() throws InterruptedException {
+        if (log.isDebugEnabled()) {
+            log.debug("Counting up["+Thread.currentThread().getName()+"] latch="+getCount());
+        }
+        sync.acquireSharedInterruptibly(1);
+    }
+
+    /**
+     * 调⽤这个⽅法来释放⼀个连接许可，那么前⾯阻塞的线程可能被唤醒
+     */
+    public long countDown() {
+        sync.releaseShared(0);
+        long result = getCount();
+        if (log.isDebugEnabled()) {
+            log.debug("Counting down["+Thread.currentThread().getName()+"] latch="+result);
+        }
+        return result;
+    }
 
     private class Sync extends AbstractQueuedSynchronizer {
         private static final long serialVersionUID = 1L;
@@ -57,113 +75,32 @@ public class LimitLatch {
         }
     }
 
-    private final Sync sync;
-    private final AtomicLong count;
-    private volatile long limit;
-    private volatile boolean released = false;
-
-    /**
-     * Instantiates a LimitLatch object with an initial limit.
-     * @param limit - maximum number of concurrent acquisitions of this latch
-     */
-    public LimitLatch(long limit) {
-        this.limit = limit;
-        this.count = new AtomicLong(0);
-        this.sync = new Sync();
-    }
-
-    /**
-     * Returns the current count for the latch
-     * @return the current count for latch
-     */
-    public long getCount() {
-        return count.get();
-    }
-
-    /**
-     * Obtain the current limit.
-     * @return the limit
-     */
-    public long getLimit() {
-        return limit;
-    }
-
-
-    /**
-     * Sets a new limit. If the limit is decreased there may be a period where
-     * more shares of the latch are acquired than the limit. In this case no
-     * more shares of the latch will be issued until sufficient shares have been
-     * returned to reduce the number of acquired shares of the latch to below
-     * the new limit. If the limit is increased, threads currently in the queue
-     * may not be issued one of the newly available shares until the next
-     * request is made for a latch.
-     *
-     * @param limit The new limit
-     */
-    public void setLimit(long limit) {
-        this.limit = limit;
-    }
-
-
-    /**
-     * Acquires a shared latch if one is available or waits for one if no shared
-     * latch is current available.
-     * @throws InterruptedException If the current thread is interrupted
-     */
-    public void countUpOrAwait() throws InterruptedException {
-        if (log.isDebugEnabled()) {
-            log.debug("Counting up["+Thread.currentThread().getName()+"] latch="+getCount());
-        }
-        sync.acquireSharedInterruptibly(1);
-    }
-
-    /**
-     * Releases a shared latch, making it available for another thread to use.
-     * @return the previous counter value
-     */
-    public long countDown() {
-        sync.releaseShared(0);
-        long result = getCount();
-        if (log.isDebugEnabled()) {
-            log.debug("Counting down["+Thread.currentThread().getName()+"] latch="+result);
-        }
-        return result;
-    }
-
-    /**
-     * Releases all waiting threads and causes the {@link #limit} to be ignored
-     * until {@link #reset()} is called.
-     * @return <code>true</code> if release was done
-     */
     public boolean releaseAll() {
         released = true;
         return sync.releaseShared(0);
     }
 
-    /**
-     * Resets the latch and initializes the shared acquisition counter to zero.
-     * @see #releaseAll()
-     */
     public void reset() {
         this.count.set(0);
         released = false;
     }
 
-    /**
-     * Returns <code>true</code> if there is at least one thread waiting to
-     * acquire the shared lock, otherwise returns <code>false</code>.
-     * @return <code>true</code> if threads are waiting
-     */
     public boolean hasQueuedThreads() {
         return sync.hasQueuedThreads();
     }
 
-    /**
-     * Provide access to the list of threads waiting to acquire this limited
-     * shared latch.
-     * @return a collection of threads
-     */
     public Collection<Thread> getQueuedThreads() {
         return sync.getQueuedThreads();
     }
+
+    public long getCount() {
+        return count.get();
+    }
+    public long getLimit() {
+        return limit;
+    }
+    public void setLimit(long limit) {
+        this.limit = limit;
+    }
+
 }

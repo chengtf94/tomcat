@@ -1,19 +1,3 @@
-/*
- *  Licensed to the Apache Software Foundation (ASF) under one or more
- *  contributor license agreements.  See the NOTICE file distributed with
- *  this work for additional information regarding copyright ownership.
- *  The ASF licenses this file to You under the Apache License, Version 2.0
- *  (the "License"); you may not use this file except in compliance with
- *  the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
 package org.apache.tomcat.util.net;
 
 import java.util.concurrent.CountDownLatch;
@@ -24,69 +8,38 @@ import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
+/***
+ * Acceptor：跑在⼀个单独的线程⾥，它在⼀个死循环⾥调⽤accept⽅法来接收新连接，
+ * ⼀旦有新的连接请求到来，accept⽅法返回⼀个Channel对象，接着把Channel对象交给Poller去处理。
+ */
 public class Acceptor<U> implements Runnable {
-
     private static final Log log = LogFactory.getLog(Acceptor.class);
     private static final StringManager sm = StringManager.getManager(Acceptor.class);
-
     private static final int INITIAL_ERROR_DELAY = 50;
     private static final int MAX_ERROR_DELAY = 1600;
 
     private final AbstractEndpoint<?,U> endpoint;
+    protected volatile AcceptorState state = AcceptorState.NEW;
     private String threadName;
-    /*
-     * Tracked separately rather than using endpoint.isRunning() as calls to
-     * endpoint.stop() and endpoint.start() in quick succession can cause the
-     * acceptor to continue running when it should terminate.
-     */
     private volatile boolean stopCalled = false;
     private final CountDownLatch stopLatch = new CountDownLatch(1);
-    protected volatile AcceptorState state = AcceptorState.NEW;
 
-
+    /**
+     * 构造方法
+     */
     public Acceptor(AbstractEndpoint<?,U> endpoint) {
         this.endpoint = endpoint;
     }
 
-
-    public final AcceptorState getState() {
-        return state;
-    }
-
-
-    final void setThreadName(final String threadName) {
-        this.threadName = threadName;
-    }
-
-
-    final String getThreadName() {
-        return threadName;
-    }
-
-
     @SuppressWarnings("deprecation")
     @Override
     public void run() {
-
         int errorDelay = 0;
         long pauseStart = 0;
-
         try {
             // Loop until we receive a shutdown command
             while (!stopCalled) {
-
                 // Loop if endpoint is paused.
-                // There are two likely scenarios here.
-                // The first scenario is that Tomcat is shutting down. In this
-                // case - and particularly for the unit tests - we want to exit
-                // this loop as quickly as possible. The second scenario is a
-                // genuine pause of the connector. In this case we want to avoid
-                // excessive CPU usage.
-                // Therefore, we start with a tight loop but if there isn't a
-                // rapid transition to stop then sleeps are introduced.
-                // < 1ms       - tight loop
-                // 1ms to 10ms - 1ms sleep
-                // > 10ms      - 10ms sleep
                 while (endpoint.isPaused() && !stopCalled) {
                     if (state != AcceptorState.PAUSED) {
                         pauseStart = System.nanoTime();
@@ -168,7 +121,7 @@ public class Acceptor<U> implements Runnable {
                             log.error(msg, t);
                         }
                     } else {
-                            log.error(msg, t);
+                        log.error(msg, t);
                     }
                 }
             }
@@ -179,28 +132,23 @@ public class Acceptor<U> implements Runnable {
     }
 
 
-    /**
-     * Signals the Acceptor to stop, waiting at most 10 seconds for the stop to
-     * complete before returning. If the stop does not complete in that time a
-     * warning will be logged.
-     *
-     * @deprecated This method will be removed in Tomcat 10.1.x onwards.
-     *             Use {@link #stop(int)} instead.
-     */
+
+    public final AcceptorState getState() {
+        return state;
+    }
+
+    final void setThreadName(final String threadName) {
+        this.threadName = threadName;
+    }
+
+    final String getThreadName() {
+        return threadName;
+    }
+
     @Deprecated
     public void stop() {
         stop(10);
     }
-
-
-    /**
-     * Signals the Acceptor to stop, optionally waiting for that stop process
-     * to complete before returning. If a wait is requested and the stop does
-     * not complete in that time a warning will be logged.
-     *
-     * @param waitSeconds The time to wait in seconds. Use a value less than
-     *                    zero for no wait.
-     */
     public void stop(int waitSeconds) {
         stopCalled = true;
         if (waitSeconds > 0) {
@@ -214,16 +162,6 @@ public class Acceptor<U> implements Runnable {
         }
     }
 
-
-    /**
-     * Handles exceptions where a delay is required to prevent a Thread from
-     * entering a tight loop which will consume CPU and may also trigger large
-     * amounts of logging. For example, this can happen if the ulimit for open
-     * files is reached.
-     *
-     * @param currentErrorDelay The current delay being applied on failure
-     * @return  The delay to apply on the next failure
-     */
     protected int handleExceptionWithDelay(int currentErrorDelay) {
         // Don't delay on first exception
         if (currentErrorDelay > 0) {
@@ -233,7 +171,6 @@ public class Acceptor<U> implements Runnable {
                 // Ignore
             }
         }
-
         // On subsequent exceptions, start the delay at 50ms, doubling the delay
         // on every subsequent exception until the delay reaches 1.6 seconds.
         if (currentErrorDelay == 0) {
@@ -249,4 +186,5 @@ public class Acceptor<U> implements Runnable {
     public enum AcceptorState {
         NEW, RUNNING, PAUSED, ENDED
     }
+
 }
