@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.startup;
 
 import java.io.File;
@@ -81,13 +65,78 @@ import org.apache.tomcat.util.res.StringManager;
  * @author Remy Maucherat
  */
 public class HostConfig implements LifecycleListener {
-
     private static final Log log = LogFactory.getLog(HostConfig.class);
+    protected static final StringManager sm = StringManager.getManager(HostConfig.class);
 
     /**
-     * The string resources for this package.
+     * Process the START event for an associated Host.
      */
-    protected static final StringManager sm = StringManager.getManager(HostConfig.class);
+    @Override
+    public void lifecycleEvent(LifecycleEvent event) {
+        // Identify the host we are associated with
+        try {
+            host = (Host) event.getLifecycle();
+            if (host instanceof StandardHost) {
+                setCopyXML(((StandardHost) host).isCopyXML());
+                setDeployXML(((StandardHost) host).isDeployXML());
+                setUnpackWARs(((StandardHost) host).isUnpackWARs());
+                setContextClass(((StandardHost) host).getContextClass());
+            }
+        } catch (ClassCastException e) {
+            log.error(sm.getString("hostConfig.cce", event.getLifecycle()), e);
+            return;
+        }
+        // Process the event that has occurred
+        if (event.getType().equals(Lifecycle.PERIODIC_EVENT)) {
+            // 执⾏check⽅法
+            check();
+        } else if (event.getType().equals(Lifecycle.BEFORE_START_EVENT)) {
+            beforeStart();
+        } else if (event.getType().equals(Lifecycle.START_EVENT)) {
+            start();
+        } else if (event.getType().equals(Lifecycle.STOP_EVENT)) {
+            stop();
+        }
+    }
+
+    /**
+     * Check status of all webapps.
+     * HostConfig会检查webapps⽬录下的所有Web应⽤，做的事情都是⽐较“宏观”的，它不会去检查具体类⽂件或者资源⽂件是否有变化，⽽是检查Web应⽤⽬录级别的变化。
+     * 1）如果原来Web应⽤⽬录被删掉了，就把相应Context容器整个销毁掉。
+     * 2）是否有新的Web应⽤⽬录放进来了，或者有新的WAR包放进来了，就部署相应的Web应⽤。
+     */
+    protected void check() {
+
+        if (host.getAutoDeploy()) {
+            // 检查这个Host下所有已经部署的Web应⽤
+            DeployedApplication[] apps = deployed.values().toArray(new DeployedApplication[0]);
+            for (DeployedApplication app : apps) {
+                if (tryAddServiced(app.name)) {
+                    try {
+                        // 检查Web应⽤⽬录是否有变化
+                        checkResources(app, false);
+                    } finally {
+                        removeServiced(app.name);
+                    }
+                }
+            }
+
+            // Check for old versions of applications that can now be undeployed
+            if (host.getUndeployOldVersions()) {
+                checkUndeploy();
+            }
+
+            // 执⾏热部署
+            deployApps();
+        }
+    }
+
+
+
+
+
+
+
 
     /**
      * The resolution, in milliseconds, of file modification times.
@@ -286,40 +335,6 @@ public class HostConfig implements LifecycleListener {
 
     // --------------------------------------------------------- Public Methods
 
-
-    /**
-     * Process the START event for an associated Host.
-     *
-     * @param event The lifecycle event that has occurred
-     */
-    @Override
-    public void lifecycleEvent(LifecycleEvent event) {
-
-        // Identify the host we are associated with
-        try {
-            host = (Host) event.getLifecycle();
-            if (host instanceof StandardHost) {
-                setCopyXML(((StandardHost) host).isCopyXML());
-                setDeployXML(((StandardHost) host).isDeployXML());
-                setUnpackWARs(((StandardHost) host).isUnpackWARs());
-                setContextClass(((StandardHost) host).getContextClass());
-            }
-        } catch (ClassCastException e) {
-            log.error(sm.getString("hostConfig.cce", event.getLifecycle()), e);
-            return;
-        }
-
-        // Process the event that has occurred
-        if (event.getType().equals(Lifecycle.PERIODIC_EVENT)) {
-            check();
-        } else if (event.getType().equals(Lifecycle.BEFORE_START_EVENT)) {
-            beforeStart();
-        } else if (event.getType().equals(Lifecycle.START_EVENT)) {
-            start();
-        } else if (event.getType().equals(Lifecycle.STOP_EVENT)) {
-            stop();
-        }
-    }
 
 
     /**
@@ -1639,33 +1654,7 @@ public class HostConfig implements LifecycleListener {
     }
 
 
-    /**
-     * Check status of all webapps.
-     */
-    protected void check() {
 
-        if (host.getAutoDeploy()) {
-            // Check for resources modification to trigger redeployment
-            DeployedApplication[] apps = deployed.values().toArray(new DeployedApplication[0]);
-            for (DeployedApplication app : apps) {
-                if (tryAddServiced(app.name)) {
-                    try {
-                        checkResources(app, false);
-                    } finally {
-                        removeServiced(app.name);
-                    }
-                }
-            }
-
-            // Check for old versions of applications that can now be undeployed
-            if (host.getUndeployOldVersions()) {
-                checkUndeploy();
-            }
-
-            // Hotdeploy applications
-            deployApps();
-        }
-    }
 
 
     /**

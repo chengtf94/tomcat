@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 import java.io.File;
@@ -145,8 +129,103 @@ import org.apache.tomcat.util.threads.ScheduledThreadPoolExecutor;
  * @author Remy Maucherat
  */
 public class StandardContext extends ContainerBase implements Context, NotificationEmitter {
-
     private static final Log log = LogFactory.getLog(StandardContext.class);
+
+    /** Tomcat的热加载是在Context容器中实现的 */
+    @Override
+    public void backgroundProcess() {
+        if (!getState().isAvailable()) {
+            return;
+        }
+        // WebappLoader周期性的检查WEB-INF/classes和WEB-INF/lib⽬录下的类⽂件
+        // WebappLoader实现热加载主要是调⽤了Context容器的reload⽅法
+        Loader loader = getLoader();
+        if (loader != null) {
+            try {
+                loader.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("standardContext.backgroundProcess.loader", loader), e);
+            }
+        }
+        // Session管理器周期性的检查是否有过期的Session
+        Manager manager = getManager();
+        if (manager != null) {
+            try {
+                manager.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("standardContext.backgroundProcess.manager", manager), e);
+            }
+        }
+        // 周期性的检查静态资源是否有变化
+        WebResourceRoot resources = getResources();
+        if (resources != null) {
+            try {
+                resources.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("standardContext.backgroundProcess.resources", resources), e);
+            }
+        }
+        InstanceManager instanceManager = getInstanceManager();
+        if (instanceManager != null) {
+            try {
+                instanceManager.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("standardContext.backgroundProcess.instanceManager", resources), e);
+            }
+        }
+        // 调⽤⽗类ContainerBase的backgroundProcess⽅法
+        super.backgroundProcess();
+    }
+
+    /**
+     * Reload this web application, if reloading is supported.
+     * ⼀个Context容器对应⼀个类加载器，类加载器在销毁的过程中会把它加载的所有类也全部销毁，在启动过程中，会创建⼀个新的类加载器来加载新的类文件
+     * 1. 停⽌和销毁Context容器及其所有⼦容器，⼦容器其实就是Wrapper，也就是说Wrapper⾥⾯Servlet实例也被销毁了。
+     * 2. 停⽌和销毁Context容器关联的Listener和Filter。
+     * 3. 停⽌和销毁Context下的Pipeline和各种Valve。
+     * 4. 停⽌和销毁Context的类加载器，以及类加载器加载的类⽂件资源。
+     * 5. 启动Context容器，在这个过程中会重新创建前⾯四步被销毁的资源。
+     * 注意：并没有调⽤Session管理器的destroy⽅法，也就是说这个Context关联的Session是没有销毁的
+     */
+    @Override
+    public synchronized void reload() {
+        if (!getState().isAvailable()) {
+            throw new IllegalStateException(sm.getString("standardContext.notStarted", getName()));
+        }
+        if (log.isInfoEnabled()) {
+            log.info(sm.getString("standardContext.reloadingStarted", getName()));
+        }
+
+        // Stop accepting requests temporarily.
+        setPaused(true);
+
+        try {
+            stop();
+        } catch (LifecycleException e) {
+            log.error(sm.getString("standardContext.stoppingContext", getName()), e);
+        }
+
+        try {
+            start();
+        } catch (LifecycleException e) {
+            log.error(sm.getString("standardContext.startingContext", getName()), e);
+        }
+
+        setPaused(false);
+
+        if (log.isInfoEnabled()) {
+            log.info(sm.getString("standardContext.reloadingCompleted", getName()));
+        }
+
+    }
+
+
+
+    /**
+     * Filter集合
+     */
+    private Map<String,FilterDef> filterDefs = new HashMap<>();
+
 
 
     // ----------------------------------------------------------- Constructors
@@ -363,10 +442,7 @@ public class StandardContext extends ContainerBase implements Context, Notificat
     private Map<String,ApplicationFilterConfig> filterConfigs = new HashMap<>(); // Guarded by filterDefs
 
 
-    /**
-     * The set of filter definitions for this application, keyed by filter name.
-     */
-    private Map<String,FilterDef> filterDefs = new HashMap<>();
+
 
 
     /**
@@ -3545,51 +3621,7 @@ public class StandardContext extends ContainerBase implements Context, Notificat
     }
 
 
-    /**
-     * Reload this web application, if reloading is supported.
-     * <p>
-     * <b>IMPLEMENTATION NOTE</b>: This method is designed to deal with reloads required by changes to classes in the
-     * underlying repositories of our class loader and changes to the web.xml file. It does not handle changes to any
-     * context.xml file. If the context.xml has changed, you should stop this Context and create (and start) a new
-     * Context instance instead. Note that there is additional code in <code>CoyoteAdapter#postParseRequest()</code> to
-     * handle mapping requests to paused Contexts.
-     *
-     * @exception IllegalStateException if the <code>reloadable</code> property is set to <code>false</code>.
-     */
-    @Override
-    public synchronized void reload() {
 
-        // Validate our current component state
-        if (!getState().isAvailable()) {
-            throw new IllegalStateException(sm.getString("standardContext.notStarted", getName()));
-        }
-
-        if (log.isInfoEnabled()) {
-            log.info(sm.getString("standardContext.reloadingStarted", getName()));
-        }
-
-        // Stop accepting requests temporarily.
-        setPaused(true);
-
-        try {
-            stop();
-        } catch (LifecycleException e) {
-            log.error(sm.getString("standardContext.stoppingContext", getName()), e);
-        }
-
-        try {
-            start();
-        } catch (LifecycleException e) {
-            log.error(sm.getString("standardContext.startingContext", getName()), e);
-        }
-
-        setPaused(false);
-
-        if (log.isInfoEnabled()) {
-            log.info(sm.getString("standardContext.reloadingCompleted", getName()));
-        }
-
-    }
 
 
     /**
@@ -5263,47 +5295,7 @@ public class StandardContext extends ContainerBase implements Context, Notificat
     }
 
 
-    @Override
-    public void backgroundProcess() {
 
-        if (!getState().isAvailable()) {
-            return;
-        }
-
-        Loader loader = getLoader();
-        if (loader != null) {
-            try {
-                loader.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("standardContext.backgroundProcess.loader", loader), e);
-            }
-        }
-        Manager manager = getManager();
-        if (manager != null) {
-            try {
-                manager.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("standardContext.backgroundProcess.manager", manager), e);
-            }
-        }
-        WebResourceRoot resources = getResources();
-        if (resources != null) {
-            try {
-                resources.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("standardContext.backgroundProcess.resources", resources), e);
-            }
-        }
-        InstanceManager instanceManager = getInstanceManager();
-        if (instanceManager != null) {
-            try {
-                instanceManager.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("standardContext.backgroundProcess.instanceManager", resources), e);
-            }
-        }
-        super.backgroundProcess();
-    }
 
 
     private void resetContext() throws Exception {

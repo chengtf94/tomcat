@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 import java.io.IOException;
@@ -36,96 +20,23 @@ import org.apache.tomcat.util.ExceptionUtils;
 import org.apache.tomcat.util.res.StringManager;
 
 /**
- * Implementation of <code>javax.servlet.FilterChain</code> used to manage the execution of a set of filters for a
- * particular request. When the set of defined filters has all been executed, the next call to <code>doFilter()</code>
- * will execute the servlet's <code>service()</code> method itself.
+ * 过滤器链
+ * 1， Filter链中除了有Filter对象的数组，还有⼀个整数变量pos，这个变量⽤来记录当前被调⽤的Filter在数组中的位置。
+ * 2. Filter链中有个Servlet实例，这个好理解，因为上⾯提到了，每个Filter链最后都会调到⼀个Servlet。
+ * 3. Filter链本身也实现了doFilter⽅法，直接调⽤了⼀个内部⽅法internalDoFilter。
+ * 4. internalDoFilter⽅法的实现⽐较有意思，它做了⼀个判断，如果当前Filter的位置⼩于Filter数组的⻓度，
+ * 也就是说Filter还没调完，就从Filter数组拿下⼀个Filter，调⽤它的doFilter⽅法。否则，意味着所有Filter都调到了，就调⽤Servlet的service⽅法。
  *
  * @author Craig R. McClanahan
  */
 public final class ApplicationFilterChain implements FilterChain {
 
-    // Used to enforce requirements of SRV.8.2 / SRV.14.2.5.1
-    private static final ThreadLocal<ServletRequest> lastServicedRequest;
-    private static final ThreadLocal<ServletResponse> lastServicedResponse;
-
-    static {
-        if (ApplicationDispatcher.WRAP_SAME_OBJECT) {
-            lastServicedRequest = new ThreadLocal<>();
-            lastServicedResponse = new ThreadLocal<>();
-        } else {
-            lastServicedRequest = null;
-            lastServicedResponse = null;
-        }
-    }
-
-    // -------------------------------------------------------------- Constants
-
-
-    public static final int INCREMENT = 10;
-
-
-    // ----------------------------------------------------- Instance Variables
-
-    /**
-     * Filters.
-     */
+    /** Filter链中有Filter数组、当前的调⽤位置、总共有多少了Filte、每个Filter链对应⼀个Servlet（它要调⽤的Servlet） */
     private ApplicationFilterConfig[] filters = new ApplicationFilterConfig[0];
-
-
-    /**
-     * The int which is used to maintain the current position in the filter chain.
-     */
     private int pos = 0;
-
-
-    /**
-     * The int which gives the current number of filters in the chain.
-     */
     private int n = 0;
-
-
-    /**
-     * The servlet instance to be executed by this chain.
-     */
     private Servlet servlet = null;
 
-
-    /**
-     * Does the associated servlet instance support async processing?
-     */
-    private boolean servletSupportsAsync = false;
-
-    /**
-     * The string manager for our package.
-     */
-    private static final StringManager sm = StringManager.getManager(ApplicationFilterChain.class);
-
-
-    /**
-     * Static class array used when the SecurityManager is turned on and <code>doFilter</code> is invoked.
-     */
-    private static final Class<?>[] classType =
-            new Class[] { ServletRequest.class, ServletResponse.class, FilterChain.class };
-
-    /**
-     * Static class array used when the SecurityManager is turned on and <code>service</code> is invoked.
-     */
-    private static final Class<?>[] classTypeUsedInService =
-            new Class[] { ServletRequest.class, ServletResponse.class };
-
-
-    // ---------------------------------------------------- FilterChain Methods
-
-    /**
-     * Invoke the next filter in this chain, passing the specified request and response. If there are no more filters in
-     * this chain, invoke the <code>service()</code> method of the servlet itself.
-     *
-     * @param request  The servlet request we are processing
-     * @param response The servlet response we are creating
-     *
-     * @exception IOException      if an input/output error occurs
-     * @exception ServletException if a servlet exception occurs
-     */
     @Override
     public void doFilter(ServletRequest request, ServletResponse response) throws IOException, ServletException {
 
@@ -155,7 +66,7 @@ public final class ApplicationFilterChain implements FilterChain {
     }
 
     private void internalDoFilter(ServletRequest request, ServletResponse response)
-            throws IOException, ServletException {
+        throws IOException, ServletException {
 
         // Call the next filter if there is one
         if (pos < n) {
@@ -164,7 +75,7 @@ public final class ApplicationFilterChain implements FilterChain {
                 Filter filter = filterConfig.getFilter();
 
                 if (request.isAsyncSupported() &&
-                        "false".equalsIgnoreCase(filterConfig.getFilterDef().getAsyncSupported())) {
+                    "false".equalsIgnoreCase(filterConfig.getFilterDef().getAsyncSupported())) {
                     request.setAttribute(Globals.ASYNC_SUPPORTED_ATTR, Boolean.FALSE);
                 }
                 if (Globals.IS_SECURITY_ENABLED) {
@@ -199,7 +110,7 @@ public final class ApplicationFilterChain implements FilterChain {
             }
             // Use potentially wrapped request from this point
             if ((request instanceof HttpServletRequest) && (response instanceof HttpServletResponse) &&
-                    Globals.IS_SECURITY_ENABLED) {
+                Globals.IS_SECURITY_ENABLED) {
                 final ServletRequest req = request;
                 final ServletResponse res = response;
                 Principal principal = ((HttpServletRequest) req).getUserPrincipal();
@@ -221,6 +132,69 @@ public final class ApplicationFilterChain implements FilterChain {
             }
         }
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // Used to enforce requirements of SRV.8.2 / SRV.14.2.5.1
+    private static final ThreadLocal<ServletRequest> lastServicedRequest;
+    private static final ThreadLocal<ServletResponse> lastServicedResponse;
+
+    static {
+        if (ApplicationDispatcher.WRAP_SAME_OBJECT) {
+            lastServicedRequest = new ThreadLocal<>();
+            lastServicedResponse = new ThreadLocal<>();
+        } else {
+            lastServicedRequest = null;
+            lastServicedResponse = null;
+        }
+    }
+
+    // -------------------------------------------------------------- Constants
+
+
+    public static final int INCREMENT = 10;
+
+
+    // ----------------------------------------------------- Instance Variables
+
+
+    /**
+     * Does the associated servlet instance support async processing?
+     */
+    private boolean servletSupportsAsync = false;
+
+    /**
+     * The string manager for our package.
+     */
+    private static final StringManager sm = StringManager.getManager(ApplicationFilterChain.class);
+
+
+    /**
+     * Static class array used when the SecurityManager is turned on and <code>doFilter</code> is invoked.
+     */
+    private static final Class<?>[] classType =
+            new Class[] { ServletRequest.class, ServletResponse.class, FilterChain.class };
+
+    /**
+     * Static class array used when the SecurityManager is turned on and <code>service</code> is invoked.
+     */
+    private static final Class<?>[] classTypeUsedInService =
+            new Class[] { ServletRequest.class, ServletResponse.class };
+
+
+    // ---------------------------------------------------- FilterChain Methods
+
 
 
     /**

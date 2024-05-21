@@ -1,19 +1,3 @@
-/*
- *  Licensed to the Apache Software Foundation (ASF) under one or more
- *  contributor license agreements.  See the NOTICE file distributed with
- *  this work for additional information regarding copyright ownership.
- *  The ASF licenses this file to You under the Apache License, Version 2.0
- *  (the "License"); you may not use this file except in compliance with
- *  the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
 package org.apache.tomcat.util.net;
 
 import java.io.EOFException;
@@ -53,6 +37,108 @@ import org.apache.tomcat.util.net.jsse.JSSESupport;
  * NIO2 endpoint.
  */
 public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousSocketChannel> {
+
+
+
+    protected class Nio2Acceptor extends Acceptor<AsynchronousSocketChannel>
+        implements CompletionHandler<AsynchronousSocketChannel, Void> {
+
+        protected int errorDelay = 0;
+
+        public Nio2Acceptor(AbstractEndpoint<?, AsynchronousSocketChannel> endpoint) {
+            super(endpoint);
+        }
+
+        @Override
+        public void run() {
+            // The initial accept will be called in a separate utility thread
+            if (!isPaused()) {
+                //if we have reached max connections, wait
+                try {
+                    countUpOrAwaitConnection();
+                } catch (InterruptedException e) {
+                    // Ignore
+                }
+                if (!isPaused()) {
+                    // Note: as a special behavior, the completion handler for accept is
+                    // always called in a separate thread.
+                    serverSock.accept(null, this);
+                } else {
+                    state = AcceptorState.PAUSED;
+                }
+            } else {
+                state = AcceptorState.PAUSED;
+            }
+        }
+
+        @Override
+        public void stop(int waitSeconds) {
+            acceptor.state = AcceptorState.ENDED;
+        }
+
+        @Override
+        public void completed(AsynchronousSocketChannel socket,
+                              Void attachment) {
+            // Successful accept, reset the error delay
+            errorDelay = 0;
+            // Continue processing the socket on the current thread
+            // Configure the socket
+            if (isRunning() && !isPaused()) {
+                // 如果没有连接限制，继续接收新的连接
+                if (getMaxConnections() == -1) {
+                    serverSock.accept(null, this);
+                } else if (getConnectionCount() < getMaxConnections()) {
+                    try {
+                        // This will not block
+                        countUpOrAwaitConnection();
+                    } catch (InterruptedException e) {
+                        // Ignore
+                    }
+                    serverSock.accept(null, this);
+                } else {
+                    // Accept again on a new thread since countUpOrAwaitConnection may block
+                    // 如果有连接限制，就在线程池⾥跑run⽅法，run⽅法会检查连接数
+                    getExecutor().execute(this);
+                }
+                // 处理请求
+                if (!setSocketOptions(socket)) {
+                    closeSocket(socket);
+                }
+            } else {
+                if (isRunning()) {
+                    state = AcceptorState.PAUSED;
+                }
+                destroySocket(socket);
+            }
+        }
+
+        @Override
+        public void failed(Throwable t, Void attachment) {
+            if (isRunning()) {
+                if (!isPaused()) {
+                    if (getMaxConnections() == -1) {
+                        serverSock.accept(null, this);
+                    } else {
+                        // Accept again on a new thread since countUpOrAwaitConnection may block
+                        getExecutor().execute(this);
+                    }
+                } else {
+                    state = AcceptorState.PAUSED;
+                }
+                // We didn't get a socket
+                countDownConnection();
+                // Introduce delay if necessary
+                errorDelay = handleExceptionWithDelay(errorDelay);
+                ExceptionUtils.handleThrowable(t);
+                log.error(sm.getString("endpoint.accept.fail"), t);
+            } else {
+                // We didn't get a socket
+                countDownConnection();
+            }
+        }
+
+    }
+
 
 
     // -------------------------------------------------------------- Constants
@@ -412,107 +498,6 @@ public class Nio2Endpoint extends AbstractJsseEndpoint<Nio2Channel,AsynchronousS
     }
 
 
-    protected class Nio2Acceptor extends Acceptor<AsynchronousSocketChannel>
-        implements CompletionHandler<AsynchronousSocketChannel, Void> {
-
-        protected int errorDelay = 0;
-
-        public Nio2Acceptor(AbstractEndpoint<?, AsynchronousSocketChannel> endpoint) {
-            super(endpoint);
-        }
-
-        @Override
-        public void run() {
-            // The initial accept will be called in a separate utility thread
-            if (!isPaused()) {
-                //if we have reached max connections, wait
-                try {
-                    countUpOrAwaitConnection();
-                } catch (InterruptedException e) {
-                    // Ignore
-                }
-                if (!isPaused()) {
-                    // Note: as a special behavior, the completion handler for accept is
-                    // always called in a separate thread.
-                    serverSock.accept(null, this);
-                } else {
-                    state = AcceptorState.PAUSED;
-                }
-            } else {
-                state = AcceptorState.PAUSED;
-            }
-        }
-
-        /**
-         * Signals the Acceptor to stop.
-         *
-         * @param waitSeconds Ignored for NIO2.
-         *
-         */
-        @Override
-        public void stop(int waitSeconds) {
-            acceptor.state = AcceptorState.ENDED;
-        }
-
-        @Override
-        public void completed(AsynchronousSocketChannel socket,
-                Void attachment) {
-            // Successful accept, reset the error delay
-            errorDelay = 0;
-            // Continue processing the socket on the current thread
-            // Configure the socket
-            if (isRunning() && !isPaused()) {
-                if (getMaxConnections() == -1) {
-                    serverSock.accept(null, this);
-                } else if (getConnectionCount() < getMaxConnections()) {
-                    try {
-                        // This will not block
-                        countUpOrAwaitConnection();
-                    } catch (InterruptedException e) {
-                        // Ignore
-                    }
-                    serverSock.accept(null, this);
-                } else {
-                    // Accept again on a new thread since countUpOrAwaitConnection may block
-                    getExecutor().execute(this);
-                }
-                if (!setSocketOptions(socket)) {
-                    closeSocket(socket);
-                }
-            } else {
-                if (isRunning()) {
-                    state = AcceptorState.PAUSED;
-                }
-                destroySocket(socket);
-            }
-        }
-
-        @Override
-        public void failed(Throwable t, Void attachment) {
-            if (isRunning()) {
-                if (!isPaused()) {
-                    if (getMaxConnections() == -1) {
-                        serverSock.accept(null, this);
-                    } else {
-                        // Accept again on a new thread since countUpOrAwaitConnection may block
-                        getExecutor().execute(this);
-                    }
-                } else {
-                    state = AcceptorState.PAUSED;
-                }
-                // We didn't get a socket
-                countDownConnection();
-                // Introduce delay if necessary
-                errorDelay = handleExceptionWithDelay(errorDelay);
-                ExceptionUtils.handleThrowable(t);
-                log.error(sm.getString("endpoint.accept.fail"), t);
-            } else {
-                // We didn't get a socket
-                countDownConnection();
-            }
-        }
-
-    }
 
     public static class Nio2SocketWrapper extends SocketWrapperBase<Nio2Channel> {
 

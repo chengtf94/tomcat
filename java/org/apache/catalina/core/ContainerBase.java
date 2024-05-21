@@ -121,6 +121,128 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
         }
     }
 
+    // -------------------- Background Thread --------------------
+    /**
+     * Start the background thread that will periodically check for session timeouts.
+     */
+    protected void threadStart() {
+        if (backgroundProcessorDelay > 0 &&
+            (getState().isAvailable() || LifecycleState.STARTING_PREP.equals(getState())) &&
+            (backgroundProcessorFuture == null || backgroundProcessorFuture.isDone())) {
+            if (backgroundProcessorFuture != null && backgroundProcessorFuture.isDone()) {
+                // There was an error executing the scheduled task, get it and log it
+                try {
+                    backgroundProcessorFuture.get();
+                } catch (InterruptedException | ExecutionException e) {
+                    log.error(sm.getString("containerBase.backgroundProcess.error"), e);
+                }
+            }
+            backgroundProcessorFuture = Container.getService(this).getServer().getUtilityExecutor()
+                .scheduleWithFixedDelay(
+                    new ContainerBackgroundProcessor(),
+                    backgroundProcessorDelay,
+                    backgroundProcessorDelay,
+                    TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Private runnable class to invoke the backgroundProcess method of this container and its children after a fixed delay.
+     */
+    protected class ContainerBackgroundProcessor implements Runnable {
+
+        @Override
+        public void run() {
+            processChildren(ContainerBase.this);
+        }
+        protected void processChildren(Container container) {
+            ClassLoader originalClassLoader = null;
+            try {
+                if (container instanceof Context) {
+                    Loader loader = ((Context) container).getLoader();
+                    // Loader will be null for FailedContext instances
+                    if (loader == null) {
+                        return;
+                    }
+                    // Ensure background processing for Contexts and Wrappers
+                    // is performed under the web app's class loader
+                    originalClassLoader = ((Context) container).bind(false, null);
+                }
+                // 1. 调⽤当前容器的backgroundProcess⽅法
+                container.backgroundProcess();
+                // 2. 遍历所有的⼦容器，递归调⽤processChildren，这样当前容器的⼦孙都会被处理
+                // 只需要在顶层容器，也就是Engine容器中启动⼀个后台线程，那么这个线程不但会执⾏Engine容器的周期性任务，它还会执⾏所有⼦容器的周期性任务。
+                Container[] children = container.findChildren();
+                for (Container child : children) {
+                    // 容器基类backgroundProcessorDelay属性如果⼤于0，表明⼦容器有⾃⼰的后台线程，⽆需⽗容器来调⽤它的processChildren⽅法
+                    if (child.getBackgroundProcessorDelay() <= 0) {
+                        processChildren(child);
+                    }
+                }
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                log.error(sm.getString("containerBase.backgroundProcess.error"), t);
+            } finally {
+                if (container instanceof Context) {
+                    ((Context) container).unbind(false, originalClassLoader);
+                }
+            }
+        }
+    }
+
+    /**
+     * 后台周期性任务
+     */
+    @Override
+    public void backgroundProcess() {
+        if (!getState().isAvailable()) {
+            return;
+        }
+        // 1.执⾏容器中Cluster组件的周期性任务
+        Cluster cluster = getClusterInternal();
+        if (cluster != null) {
+            try {
+                cluster.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("containerBase.backgroundProcess.cluster", cluster), e);
+            }
+        }
+        // 2.执⾏容器中Realm组件的周期性任务
+        Realm realm = getRealmInternal();
+        if (realm != null) {
+            try {
+                realm.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("containerBase.backgroundProcess.realm", realm), e);
+            }
+        }
+        // 3.执⾏容器中Valve组件的周期性任务
+        Valve current = pipeline.getFirst();
+        while (current != null) {
+            try {
+                current.backgroundProcess();
+            } catch (Exception e) {
+                log.warn(sm.getString("containerBase.backgroundProcess.valve", current), e);
+            }
+            current = current.getNext();
+        }
+        // 4. 触发容器的"周期事件"，Host容器的监听器HostConfig就靠它来调⽤
+        // 周期事件跟⽣命周期事件⼀样，是⼀种扩展机制，你可以这样理解：⼜⼀段时间过去了，容器还活着，你想做点什么吗？
+        // 如果你想做点什么，就创建⼀个监听器来监听这个“周期事件”，事件到了我负责调⽤你的⽅法。
+        fireLifecycleEvent(PERIODIC_EVENT, null);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -985,44 +1107,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
     }
 
 
-    /**
-     * Execute a periodic task, such as reloading, etc. This method will be invoked inside the classloading context of
-     * this container. Unexpected throwables will be caught and logged.
-     */
-    @Override
-    public void backgroundProcess() {
 
-        if (!getState().isAvailable()) {
-            return;
-        }
-
-        Cluster cluster = getClusterInternal();
-        if (cluster != null) {
-            try {
-                cluster.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("containerBase.backgroundProcess.cluster", cluster), e);
-            }
-        }
-        Realm realm = getRealmInternal();
-        if (realm != null) {
-            try {
-                realm.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("containerBase.backgroundProcess.realm", realm), e);
-            }
-        }
-        Valve current = pipeline.getFirst();
-        while (current != null) {
-            try {
-                current.backgroundProcess();
-            } catch (Exception e) {
-                log.warn(sm.getString("containerBase.backgroundProcess.valve", current), e);
-            }
-            current = current.getNext();
-        }
-        fireLifecycleEvent(PERIODIC_EVENT, null);
-    }
 
 
     @Override
@@ -1137,28 +1222,7 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
     }
 
 
-    // -------------------- Background Thread --------------------
 
-    /**
-     * Start the background thread that will periodically check for session timeouts.
-     */
-    protected void threadStart() {
-        if (backgroundProcessorDelay > 0 &&
-                (getState().isAvailable() || LifecycleState.STARTING_PREP.equals(getState())) &&
-                (backgroundProcessorFuture == null || backgroundProcessorFuture.isDone())) {
-            if (backgroundProcessorFuture != null && backgroundProcessorFuture.isDone()) {
-                // There was an error executing the scheduled task, get it and log it
-                try {
-                    backgroundProcessorFuture.get();
-                } catch (InterruptedException | ExecutionException e) {
-                    log.error(sm.getString("containerBase.backgroundProcess.error"), e);
-                }
-            }
-            backgroundProcessorFuture = Container.getService(this).getServer().getUtilityExecutor()
-                    .scheduleWithFixedDelay(new ContainerBackgroundProcessor(), backgroundProcessorDelay,
-                            backgroundProcessorDelay, TimeUnit.SECONDS);
-        }
-    }
 
 
     /**
@@ -1194,50 +1258,6 @@ public abstract class ContainerBase extends LifecycleMBeanBase implements Contai
         public void run() {
             if (getState().isAvailable()) {
                 threadStart();
-            }
-        }
-    }
-
-    /**
-     * Private runnable class to invoke the backgroundProcess method of this container and its children after a fixed
-     * delay.
-     */
-    protected class ContainerBackgroundProcessor implements Runnable {
-
-        @Override
-        public void run() {
-            processChildren(ContainerBase.this);
-        }
-
-        protected void processChildren(Container container) {
-            ClassLoader originalClassLoader = null;
-
-            try {
-                if (container instanceof Context) {
-                    Loader loader = ((Context) container).getLoader();
-                    // Loader will be null for FailedContext instances
-                    if (loader == null) {
-                        return;
-                    }
-
-                    // Ensure background processing for Contexts and Wrappers
-                    // is performed under the web app's class loader
-                    originalClassLoader = ((Context) container).bind(false, null);
-                }
-                container.backgroundProcess();
-                Container[] children = container.findChildren();
-                for (Container child : children) {
-                    if (child.getBackgroundProcessorDelay() <= 0) {
-                        processChildren(child);
-                    }
-                }
-            } catch (Throwable t) {
-                ExceptionUtils.handleThrowable(t);
-                log.error(sm.getString("containerBase.backgroundProcess.error"), t);
-            } finally {
-                if (container instanceof Context) {
-                    ((Context) container).unbind(false, originalClassLoader);
-                }
             }
         }
     }

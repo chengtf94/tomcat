@@ -70,12 +70,10 @@ import org.apache.tomcat.util.threads.ThreadPoolExecutor;
  */
 public abstract class WebappClassLoaderBase extends URLClassLoader
         implements Lifecycle, InstrumentableClassLoader, WebappProperties, PermissionCheck {
-
     private static final Log log = LogFactory.getLog(WebappClassLoaderBase.class);
 
     @Override
     public Class<?> findClass(String name) throws ClassNotFoundException {
-
         if (log.isDebugEnabled()) {
             log.debug("    findClass(" + name + ")");
         }

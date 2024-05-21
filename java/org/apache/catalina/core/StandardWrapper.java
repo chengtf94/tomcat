@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 import java.io.PrintStream;
@@ -63,6 +47,8 @@ import org.apache.tomcat.util.modeler.Registry;
 import org.apache.tomcat.util.modeler.Util;
 
 /**
+ * Wrapper容器：Servlet的包装
+ * Servlet不仅仅是⼀个类实例，它还有相关的配置信息，例如URL映射、初始化参数等，因此设计出了⼀个包装器，把Servlet本身和它相关的数据包起来，没错，这就是⾯向对象的思想。
  * Standard implementation of the <b>Wrapper</b> interface that represents an individual servlet definition. No child
  * Containers are allowed, and the parent Container must be a Context.
  *
@@ -71,10 +57,118 @@ import org.apache.tomcat.util.modeler.Util;
  */
 @SuppressWarnings("deprecation") // SingleThreadModel
 public class StandardWrapper extends ContainerBase implements ServletConfig, Wrapper, NotificationEmitter {
-
     private final Log log = LogFactory.getLog(StandardWrapper.class); // must not be static
-
     protected static final String[] DEFAULT_SERVLET_METHODS = new String[] { "GET", "HEAD", "POST" };
+
+    /**
+     * Servlet实例
+     */
+    protected volatile Servlet instance = null;
+
+    /**
+     * 实例化Servlet：为了加快系统的启动速度，采取资源延迟加载的策略，默认情况下Tomcat在启动时不会加载你的Servlet
+     */
+    public synchronized Servlet loadServlet() throws ServletException {
+        if (!singleThreadModel && (instance != null)) {
+            return instance;
+        }
+
+        PrintStream out = System.out;
+        if (swallowOutput) {
+            SystemLogHandler.startCapture();
+        }
+
+        Servlet servlet;
+        try {
+            long t1 = System.currentTimeMillis();
+            // Complain if no servlet class has been specified
+            if (servletClass == null) {
+                unavailable(null);
+                throw new ServletException(sm.getString("standardWrapper.notClass", getName()));
+            }
+
+            InstanceManager instanceManager = ((StandardContext) getParent()).getInstanceManager();
+            try {
+                // 1. 创建⼀个Servlet实例
+                servlet = (Servlet) instanceManager.newInstance(servletClass);
+            } catch (ClassCastException e) {
+                unavailable(null);
+                // Restore the context ClassLoader
+                throw new ServletException(sm.getString("standardWrapper.notServlet", servletClass), e);
+            } catch (Throwable e) {
+                e = ExceptionUtils.unwrapInvocationTargetException(e);
+                ExceptionUtils.handleThrowable(e);
+                unavailable(null);
+
+                // Added extra log statement for Bugzilla 36630:
+                // https://bz.apache.org/bugzilla/show_bug.cgi?id=36630
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("standardWrapper.instantiate", servletClass), e);
+                }
+
+                // Restore the context ClassLoader
+                throw new ServletException(sm.getString("standardWrapper.instantiate", servletClass), e);
+            }
+
+            if (multipartConfigElement == null) {
+                MultipartConfig annotation = servlet.getClass().getAnnotation(MultipartConfig.class);
+                if (annotation != null) {
+                    multipartConfigElement = new MultipartConfigElement(annotation);
+                }
+            }
+
+            // Special handling for ContainerServlet instances
+            // Note: The InstanceManager checks if the application is permitted
+            // to load ContainerServlets
+            if (servlet instanceof ContainerServlet) {
+                ((ContainerServlet) servlet).setWrapper(this);
+            }
+
+            classLoadTime = (int) (System.currentTimeMillis() - t1);
+
+            if (servlet instanceof SingleThreadModel) {
+                if (instancePool == null) {
+                    instancePool = new Stack<>();
+                }
+                singleThreadModel = true;
+            }
+
+            // 2.调⽤了Servlet的init⽅法，这是Servlet规范要求的
+            initServlet(servlet);
+
+            fireContainerEvent("load", this);
+
+            loadTime = System.currentTimeMillis() - t1;
+        } finally {
+            if (swallowOutput) {
+                String log = SystemLogHandler.stopCapture();
+                if (log != null && log.length() > 0) {
+                    if (getServletContext() != null) {
+                        getServletContext().log(log);
+                    } else {
+                        out.println(log);
+                    }
+                }
+            }
+        }
+        return servlet;
+
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     // ----------------------------------------------------------- Constructors
 
@@ -120,10 +214,6 @@ public class StandardWrapper extends ContainerBase implements ServletConfig, Wra
     protected final StandardWrapperFacade facade = new StandardWrapperFacade(this);
 
 
-    /**
-     * The (single) possibly uninitialized instance of this servlet.
-     */
-    protected volatile Servlet instance = null;
 
 
     /**
@@ -985,101 +1075,6 @@ public class StandardWrapper extends ContainerBase implements ServletConfig, Wra
     }
 
 
-    /**
-     * Load and initialize an instance of this servlet, if there is not already at least one initialized instance. This
-     * can be used, for example, to load servlets that are marked in the deployment descriptor to be loaded at server
-     * startup time.
-     *
-     * @return the loaded Servlet instance
-     *
-     * @throws ServletException for a Servlet load error
-     */
-    public synchronized Servlet loadServlet() throws ServletException {
-
-        // Nothing to do if we already have an instance or an instance pool
-        if (!singleThreadModel && (instance != null)) {
-            return instance;
-        }
-
-        PrintStream out = System.out;
-        if (swallowOutput) {
-            SystemLogHandler.startCapture();
-        }
-
-        Servlet servlet;
-        try {
-            long t1 = System.currentTimeMillis();
-            // Complain if no servlet class has been specified
-            if (servletClass == null) {
-                unavailable(null);
-                throw new ServletException(sm.getString("standardWrapper.notClass", getName()));
-            }
-
-            InstanceManager instanceManager = ((StandardContext) getParent()).getInstanceManager();
-            try {
-                servlet = (Servlet) instanceManager.newInstance(servletClass);
-            } catch (ClassCastException e) {
-                unavailable(null);
-                // Restore the context ClassLoader
-                throw new ServletException(sm.getString("standardWrapper.notServlet", servletClass), e);
-            } catch (Throwable e) {
-                e = ExceptionUtils.unwrapInvocationTargetException(e);
-                ExceptionUtils.handleThrowable(e);
-                unavailable(null);
-
-                // Added extra log statement for Bugzilla 36630:
-                // https://bz.apache.org/bugzilla/show_bug.cgi?id=36630
-                if (log.isDebugEnabled()) {
-                    log.debug(sm.getString("standardWrapper.instantiate", servletClass), e);
-                }
-
-                // Restore the context ClassLoader
-                throw new ServletException(sm.getString("standardWrapper.instantiate", servletClass), e);
-            }
-
-            if (multipartConfigElement == null) {
-                MultipartConfig annotation = servlet.getClass().getAnnotation(MultipartConfig.class);
-                if (annotation != null) {
-                    multipartConfigElement = new MultipartConfigElement(annotation);
-                }
-            }
-
-            // Special handling for ContainerServlet instances
-            // Note: The InstanceManager checks if the application is permitted
-            // to load ContainerServlets
-            if (servlet instanceof ContainerServlet) {
-                ((ContainerServlet) servlet).setWrapper(this);
-            }
-
-            classLoadTime = (int) (System.currentTimeMillis() - t1);
-
-            if (servlet instanceof SingleThreadModel) {
-                if (instancePool == null) {
-                    instancePool = new Stack<>();
-                }
-                singleThreadModel = true;
-            }
-
-            initServlet(servlet);
-
-            fireContainerEvent("load", this);
-
-            loadTime = System.currentTimeMillis() - t1;
-        } finally {
-            if (swallowOutput) {
-                String log = SystemLogHandler.stopCapture();
-                if (log != null && log.length() > 0) {
-                    if (getServletContext() != null) {
-                        getServletContext().log(log);
-                    } else {
-                        out.println(log);
-                    }
-                }
-            }
-        }
-        return servlet;
-
-    }
 
 
     private synchronized void initServlet(Servlet servlet) throws ServletException {

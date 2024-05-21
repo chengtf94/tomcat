@@ -77,7 +77,7 @@ public abstract class LifecycleBase implements Lifecycle {
         }
         if (check) {
             if (state == null) {
-                invalidTransition("null");d
+                invalidTransition("null");
                 return;
             }
             if (!(state == LifecycleState.FAILED ||

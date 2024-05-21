@@ -106,8 +106,9 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel> 
         serverSock.configureBlocking(true);
     }
 
+    // ---------------------------------------------- SocketProcessor Inner Class
     /**
-     * 质是⼀个Selector，也跑在单独线程⾥。Poller在内部维护⼀个Channel数组，它在⼀个死循环⾥不断检测Channel的数据就绪状态，
+     * Poller：本质是⼀个Selector，也跑在单独线程⾥。Poller在内部维护⼀个Channel数组，它在⼀个死循环⾥不断检测Channel的数据就绪状态，
      * ⼀旦有Channel可读，就⽣成⼀个SocketProcessor任务对象扔给Executor去处理。
      */
     public class Poller implements Runnable {
@@ -588,7 +589,101 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel> 
 
     }
 
+    // ---------------------------------------------- SocketProcessor Inner Class
+    /**
+     * 用于定义Executor中线程所执⾏的任务，主要就是调⽤Http11Processor组件来处理请求。其run⽅法会调⽤Http11Processor来读取和解析请求数据；
+     * Http11Processor是应⽤层协议的封装，它读取Channel的数据来⽣成ServletRequest对象，并调⽤容器获得响应，再把响应通过Channel写出。
+     */
+    protected class SocketProcessor extends SocketProcessorBase<NioChannel> {
 
+        public SocketProcessor(SocketWrapperBase<NioChannel> socketWrapper, SocketEvent event) {
+            super(socketWrapper, event);
+        }
+
+        @Override
+        protected void doRun() {
+            Poller poller = NioEndpoint.this.poller;
+            if (poller == null) {
+                socketWrapper.close();
+                return;
+            }
+
+            try {
+                int handshake = -1;
+                try {
+                    if (socketWrapper.getSocket().isHandshakeComplete()) {
+                        // No TLS handshaking required. Let the handler
+                        // process this socket / event combination.
+                        handshake = 0;
+                    } else if (event == SocketEvent.STOP || event == SocketEvent.DISCONNECT ||
+                        event == SocketEvent.ERROR) {
+                        // Unable to complete the TLS handshake. Treat it as
+                        // if the handshake failed.
+                        handshake = -1;
+                    } else {
+                        handshake = socketWrapper.getSocket().handshake(event == SocketEvent.OPEN_READ, event == SocketEvent.OPEN_WRITE);
+                        event = SocketEvent.OPEN_READ;
+                    }
+                } catch (IOException x) {
+                    handshake = -1;
+                    if (logHandshake.isDebugEnabled()) {
+                        logHandshake.debug(sm.getString("endpoint.err.handshake",
+                            socketWrapper.getRemoteAddr(), Integer.toString(socketWrapper.getRemotePort())), x);
+                    }
+                } catch (CancelledKeyException ckx) {
+                    handshake = -1;
+                }
+                if (handshake == 0) {
+                    SocketState state = SocketState.OPEN;
+                    // Process the request from this socket
+                    if (event == null) {
+                        state = getHandler().process(socketWrapper, SocketEvent.OPEN_READ);
+                    } else {
+                        state = getHandler().process(socketWrapper, event);
+                    }
+                    if (state == SocketState.CLOSED) {
+                        poller.cancelledKey(getSelectionKey(), socketWrapper);
+                    }
+                } else if (handshake == -1 ) {
+                    getHandler().process(socketWrapper, SocketEvent.CONNECT_FAIL);
+                    poller.cancelledKey(getSelectionKey(), socketWrapper);
+                } else if (handshake == SelectionKey.OP_READ){
+                    socketWrapper.registerReadInterest();
+                } else if (handshake == SelectionKey.OP_WRITE){
+                    socketWrapper.registerWriteInterest();
+                }
+            } catch (CancelledKeyException cx) {
+                poller.cancelledKey(getSelectionKey(), socketWrapper);
+            } catch (VirtualMachineError vme) {
+                ExceptionUtils.handleThrowable(vme);
+            } catch (Throwable t) {
+                log.error(sm.getString("endpoint.processing.fail"), t);
+                poller.cancelledKey(getSelectionKey(), socketWrapper);
+            } finally {
+                socketWrapper = null;
+                event = null;
+                //return to cache
+                if (running && processorCache != null) {
+                    processorCache.push(this);
+                }
+            }
+        }
+
+        private SelectionKey getSelectionKey() {
+            // Shortcut for Java 11 onwards
+            if (JreCompat.isJre11Available()) {
+                return null;
+            }
+
+            SocketChannel socketChannel = socketWrapper.getSocket().getIOChannel();
+            if (socketChannel == null) {
+                return null;
+            }
+
+            return socketChannel.keyFor(NioEndpoint.this.poller.getSelector());
+        }
+
+    }
 
 
 
@@ -1693,116 +1788,7 @@ public class NioEndpoint extends AbstractJsseEndpoint<NioChannel,SocketChannel> 
     }
 
 
-    // ---------------------------------------------- SocketProcessor Inner Class
 
-    /**
-     * This class is the equivalent of the Worker, but will simply use in an
-     * external Executor thread pool.
-     */
-    protected class SocketProcessor extends SocketProcessorBase<NioChannel> {
-
-        public SocketProcessor(SocketWrapperBase<NioChannel> socketWrapper, SocketEvent event) {
-            super(socketWrapper, event);
-        }
-
-        @Override
-        protected void doRun() {
-            /*
-             * Do not cache and re-use the value of socketWrapper.getSocket() in
-             * this method. If the socket closes the value will be updated to
-             * CLOSED_NIO_CHANNEL and the previous value potentially re-used for
-             * a new connection. That can result in a stale cached value which
-             * in turn can result in unintentionally closing currently active
-             * connections.
-             */
-            Poller poller = NioEndpoint.this.poller;
-            if (poller == null) {
-                socketWrapper.close();
-                return;
-            }
-
-            try {
-                int handshake = -1;
-                try {
-                    if (socketWrapper.getSocket().isHandshakeComplete()) {
-                        // No TLS handshaking required. Let the handler
-                        // process this socket / event combination.
-                        handshake = 0;
-                    } else if (event == SocketEvent.STOP || event == SocketEvent.DISCONNECT ||
-                            event == SocketEvent.ERROR) {
-                        // Unable to complete the TLS handshake. Treat it as
-                        // if the handshake failed.
-                        handshake = -1;
-                    } else {
-                        handshake = socketWrapper.getSocket().handshake(event == SocketEvent.OPEN_READ, event == SocketEvent.OPEN_WRITE);
-                        // The handshake process reads/writes from/to the
-                        // socket. status may therefore be OPEN_WRITE once
-                        // the handshake completes. However, the handshake
-                        // happens when the socket is opened so the status
-                        // must always be OPEN_READ after it completes. It
-                        // is OK to always set this as it is only used if
-                        // the handshake completes.
-                        event = SocketEvent.OPEN_READ;
-                    }
-                } catch (IOException x) {
-                    handshake = -1;
-                    if (logHandshake.isDebugEnabled()) {
-                        logHandshake.debug(sm.getString("endpoint.err.handshake",
-                                socketWrapper.getRemoteAddr(), Integer.toString(socketWrapper.getRemotePort())), x);
-                    }
-                } catch (CancelledKeyException ckx) {
-                    handshake = -1;
-                }
-                if (handshake == 0) {
-                    SocketState state = SocketState.OPEN;
-                    // Process the request from this socket
-                    if (event == null) {
-                        state = getHandler().process(socketWrapper, SocketEvent.OPEN_READ);
-                    } else {
-                        state = getHandler().process(socketWrapper, event);
-                    }
-                    if (state == SocketState.CLOSED) {
-                        poller.cancelledKey(getSelectionKey(), socketWrapper);
-                    }
-                } else if (handshake == -1 ) {
-                    getHandler().process(socketWrapper, SocketEvent.CONNECT_FAIL);
-                    poller.cancelledKey(getSelectionKey(), socketWrapper);
-                } else if (handshake == SelectionKey.OP_READ){
-                    socketWrapper.registerReadInterest();
-                } else if (handshake == SelectionKey.OP_WRITE){
-                    socketWrapper.registerWriteInterest();
-                }
-            } catch (CancelledKeyException cx) {
-                poller.cancelledKey(getSelectionKey(), socketWrapper);
-            } catch (VirtualMachineError vme) {
-                ExceptionUtils.handleThrowable(vme);
-            } catch (Throwable t) {
-                log.error(sm.getString("endpoint.processing.fail"), t);
-                poller.cancelledKey(getSelectionKey(), socketWrapper);
-            } finally {
-                socketWrapper = null;
-                event = null;
-                //return to cache
-                if (running && processorCache != null) {
-                    processorCache.push(this);
-                }
-            }
-        }
-
-        private SelectionKey getSelectionKey() {
-            // Shortcut for Java 11 onwards
-            if (JreCompat.isJre11Available()) {
-                return null;
-            }
-
-            SocketChannel socketChannel = socketWrapper.getSocket().getIOChannel();
-            if (socketChannel == null) {
-                return null;
-            }
-
-            return socketChannel.keyFor(NioEndpoint.this.poller.getSelector());
-        }
-    }
 
 
     // ----------------------------------------------- SendfileData Inner Class

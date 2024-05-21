@@ -1,19 +1,3 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package org.apache.catalina.core;
 
 
@@ -48,40 +32,11 @@ import org.apache.tomcat.util.res.StringManager;
  * @author Craig R. McClanahan
  */
 final class StandardWrapperValve extends ValveBase {
-
     private static final StringManager sm = StringManager.getManager(StandardWrapperValve.class);
 
 
-    // ------------------------------------------------------ Constructor
-
-    StandardWrapperValve() {
-        super(true);
-    }
-
-
-    // ----------------------------------------------------- Instance Variables
-
-    // Some JMX statistics. This valve is associated with a StandardWrapper.
-    // We expose the StandardWrapper as JMX ( j2eeType=Servlet ). The fields
-    // are here for performance.
-    private final LongAdder processingTime = new LongAdder();
-    private volatile long maxTime;
-    private volatile long minTime = Long.MAX_VALUE;
-    private final AtomicInteger requestCount = new AtomicInteger(0);
-    private final AtomicInteger errorCount = new AtomicInteger(0);
-
-
-    // --------------------------------------------------------- Public Methods
-
     /**
-     * Invoke the servlet we are managing, respecting the rules regarding servlet lifecycle and SingleThreadModel
-     * support.
-     *
-     * @param request  Request to be processed
-     * @param response Response to be produced
-     *
-     * @exception IOException      if an input/output error occurred
-     * @exception ServletException if a servlet error occurred
+     * Invoke the servlet we are managing, respecting the rules regarding servlet lifecycle and SingleThreadModel support.
      */
     @Override
     public void invoke(Request request, Response response) throws IOException, ServletException {
@@ -99,7 +54,7 @@ final class StandardWrapperValve extends ValveBase {
         // Check for the application being marked unavailable
         if (!context.getState().isAvailable()) {
             response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE,
-                    sm.getString("standardContext.isUnavailable"));
+                sm.getString("standardContext.isUnavailable"));
             unavailable = true;
         }
 
@@ -110,7 +65,7 @@ final class StandardWrapperValve extends ValveBase {
             unavailable = true;
         }
 
-        // Allocate a servlet instance to process this request
+        // 1.实例化Servlet
         try {
             if (!unavailable) {
                 servlet = wrapper.allocate();
@@ -120,7 +75,7 @@ final class StandardWrapperValve extends ValveBase {
             checkWrapperAvailable(response, wrapper);
         } catch (ServletException e) {
             container.getLogger().error(sm.getString("standardWrapper.allocateException", wrapper.getName()),
-                    StandardWrapper.getRootCause(e));
+                StandardWrapper.getRootCause(e));
             throwable = e;
             exception(request, response, e);
         } catch (Throwable e) {
@@ -138,7 +93,8 @@ final class StandardWrapperValve extends ValveBase {
         }
         request.setAttribute(Globals.DISPATCHER_TYPE_ATTR, dispatcherType);
         request.setAttribute(Globals.DISPATCHER_REQUEST_PATH_ATTR, requestPathMB);
-        // Create the filter chain for this request
+
+        // 2.给当前请求创建⼀个Filter链
         ApplicationFilterChain filterChain = ApplicationFilterFactory.createFilterChain(request, wrapper, servlet);
 
         // Call the filter chain for this request
@@ -153,6 +109,7 @@ final class StandardWrapperValve extends ValveBase {
                         if (request.isAsyncDispatching()) {
                             request.getAsyncContextInternal().doInternalDispatch();
                         } else {
+                            // 3. 调⽤这个Filter链，Filter链中的最后⼀个Filter会调⽤Servlet
                             filterChain.doFilter(request.getRequest(), response.getResponse());
                         }
                     } finally {
@@ -173,25 +130,25 @@ final class StandardWrapperValve extends ValveBase {
         } catch (BadRequestException e) {
             if (container.getLogger().isDebugEnabled()) {
                 container.getLogger().debug(
-                        sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
+                    sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
             }
             throwable = e;
             exception(request, response, e, HttpServletResponse.SC_BAD_REQUEST);
         } catch (CloseNowException e) {
             if (container.getLogger().isDebugEnabled()) {
                 container.getLogger().debug(
-                        sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
+                    sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
             }
             throwable = e;
             exception(request, response, e);
         } catch (IOException e) {
             container.getLogger()
-                    .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
+                .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
             throwable = e;
             exception(request, response, e);
         } catch (UnavailableException e) {
             container.getLogger()
-                    .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
+                .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
             wrapper.unavailable(e);
             checkWrapperAvailable(response, wrapper);
             // Do not save exception in 'throwable', because we
@@ -200,14 +157,14 @@ final class StandardWrapperValve extends ValveBase {
             Throwable rootCause = StandardWrapper.getRootCause(e);
             if (!(rootCause instanceof BadRequestException)) {
                 container.getLogger().error(sm.getString("standardWrapper.serviceExceptionRoot", wrapper.getName(),
-                        context.getName(), e.getMessage()), rootCause);
+                    context.getName(), e.getMessage()), rootCause);
             }
             throwable = e;
             exception(request, response, e);
         } catch (Throwable e) {
             ExceptionUtils.handleThrowable(e);
             container.getLogger()
-                    .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
+                .error(sm.getString("standardWrapper.serviceException", wrapper.getName(), context.getName()), e);
             throwable = e;
             exception(request, response, e);
         } finally {
@@ -255,6 +212,41 @@ final class StandardWrapperValve extends ValveBase {
             }
         }
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // ------------------------------------------------------ Constructor
+
+    StandardWrapperValve() {
+        super(true);
+    }
+
+
+    // ----------------------------------------------------- Instance Variables
+
+    // Some JMX statistics. This valve is associated with a StandardWrapper.
+    // We expose the StandardWrapper as JMX ( j2eeType=Servlet ). The fields
+    // are here for performance.
+    private final LongAdder processingTime = new LongAdder();
+    private volatile long maxTime;
+    private volatile long minTime = Long.MAX_VALUE;
+    private final AtomicInteger requestCount = new AtomicInteger(0);
+    private final AtomicInteger errorCount = new AtomicInteger(0);
+
+
+    // --------------------------------------------------------- Public Methods
+
+
 
     private void checkWrapperAvailable(Response response, StandardWrapper wrapper) throws IOException {
         long available = wrapper.getAvailable();
